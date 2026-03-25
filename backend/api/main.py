@@ -1,6 +1,8 @@
 """FastAPI backend for BTC 5-min trading bot dashboard."""
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -20,9 +22,9 @@ from backend.data.crypto import fetch_crypto_price, compute_btc_microstructure
 from pydantic import BaseModel
 
 app = FastAPI(
-    title="BTC 5-Min Trading Bot",
-    description="Polymarket BTC Up/Down 5-minute market trading bot",
-    version="3.0.0"
+    title="Weather Edge",
+    description="Kalshi weather market signal engine — GFS 31-member ensemble + METAR real-time",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -226,7 +228,8 @@ class EventResponse(BaseModel):
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("BTC 5-MIN TRADING BOT v3.0")
+    print("WEATHER EDGE v2.0")
+    print("GFS Ensemble + METAR Real-Time Kalshi Signal Engine")
     print("=" * 60)
     print("Initializing database...")
 
@@ -245,30 +248,26 @@ async def startup():
             )
             db.add(state)
             db.commit()
-            print(f"Created new bot state with ${settings.INITIAL_BANKROLL:,.2f} bankroll")
+            print(f"Initialized fresh state")
         else:
             state.is_running = True
             db.commit()
-            print(f"Loaded bot state: Bankroll ${state.bankroll:,.2f}, P&L ${state.total_pnl:+,.2f}, {state.total_trades} trades")
     finally:
         db.close()
 
     print("")
     print("Configuration:")
     print(f"  - Simulation mode: {settings.SIMULATION_MODE}")
-    print(f"  - Min edge threshold: {settings.MIN_EDGE_THRESHOLD:.0%}")
+    print(f"  - Weather edge threshold: {settings.WEATHER_MIN_EDGE_THRESHOLD:.0%}")
     print(f"  - Kelly fraction: {settings.KELLY_FRACTION:.0%}")
-    print(f"  - Scan interval: {settings.SCAN_INTERVAL_SECONDS}s")
-    print(f"  - Settlement interval: {settings.SETTLEMENT_INTERVAL_SECONDS}s")
+    print(f"  - Weather scan: every {settings.WEATHER_SCAN_INTERVAL_SECONDS}s")
     print("")
 
     from backend.core.scheduler import start_scheduler, log_event
     start_scheduler()
-    log_event("success", "BTC 5-min trading bot initialized")
+    log_event("success", "Weather Edge initialized")
 
-    print("Bot is now running!")
-    print(f"  - BTC scan: every {settings.SCAN_INTERVAL_SECONDS}s (edge >= {settings.MIN_EDGE_THRESHOLD:.0%})")
-    print(f"  - Settlement check: every {settings.SETTLEMENT_INTERVAL_SECONDS}s")
+    print("Weather Edge is now running!")
     if settings.WEATHER_ENABLED:
         print(f"  - Weather scan: every {settings.WEATHER_SCAN_INTERVAL_SECONDS}s (edge >= {settings.WEATHER_MIN_EDGE_THRESHOLD:.0%})")
         print(f"  - Weather cities: {settings.WEATHER_CITIES}")
@@ -284,9 +283,9 @@ async def shutdown():
 
 
 # Core endpoints
-@app.get("/")
+@app.get("/api/status")
 async def root():
-    return {"status": "ok", "message": "BTC 5-Min Trading Bot API v3.0", "simulation_mode": settings.SIMULATION_MODE}
+    return {"status": "ok", "message": "Weather Edge API v2.0 — GFS Ensemble + METAR", "simulation_mode": settings.SIMULATION_MODE}
 
 
 @app.get("/api/health")
@@ -361,7 +360,9 @@ async def get_btc_windows():
 
 @app.get("/api/signals", response_model=List[SignalResponse])
 async def get_signals():
-    """Get current BTC trading signals."""
+    """Get current BTC trading signals (returns empty if BTC disabled)."""
+    if not settings.BTC_ENABLED:
+        return []
     try:
         signals = await scan_for_signals()
         return [_signal_to_response(s) for s in signals]
@@ -371,7 +372,9 @@ async def get_signals():
 
 @app.get("/api/signals/actionable", response_model=List[SignalResponse])
 async def get_actionable_signals():
-    """Get only signals that pass the edge threshold."""
+    """Get only signals that pass the edge threshold (returns empty if BTC disabled)."""
+    if not settings.BTC_ENABLED:
+        return []
     try:
         signals = await scan_for_signals()
         actionable = [s for s in signals if s.passes_threshold]
@@ -408,6 +411,48 @@ async def get_trades(
     status: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
+    from backend.data.kalshi_client import kalshi_credentials_present
+
+    # If Kalshi is configured and not in simulation mode, return real fills
+    if kalshi_credentials_present() and not settings.SIMULATION_MODE:
+        try:
+            from backend.data.kalshi_client import KalshiClient
+            client = KalshiClient()
+            fills_data = await client.get("/portfolio/fills", params={"limit": limit})
+            fills = fills_data.get("fills", [])
+            result = []
+            for i, fill in enumerate(fills):
+                action = fill.get("action", "buy")
+                direction = "YES" if action == "buy" else "NO"
+                side = fill.get("side", "yes")
+                price_cents = fill.get("yes_price", fill.get("no_price", 50))
+                entry_price = price_cents / 100.0
+                created_time = fill.get("created_time", datetime.utcnow().isoformat())
+                if isinstance(created_time, str):
+                    try:
+                        ts = datetime.fromisoformat(created_time.replace("Z", "+00:00"))
+                    except Exception:
+                        ts = datetime.utcnow()
+                else:
+                    ts = datetime.utcnow()
+                result.append(TradeResponse(
+                    id=i + 1,
+                    market_ticker=fill.get("ticker", ""),
+                    platform="kalshi",
+                    event_slug=fill.get("ticker", ""),
+                    direction=side.upper(),
+                    entry_price=entry_price,
+                    size=fill.get("count", 0) * entry_price,
+                    timestamp=ts,
+                    settled=False,
+                    result="pending",
+                    pnl=None,
+                ))
+            return result
+        except Exception:
+            pass  # Fall through to DB trades on error
+
+    # Default: DB trades (simulation)
     query = db.query(Trade)
     if status:
         query = query.filter(Trade.result == status)
@@ -433,6 +478,25 @@ async def get_trades(
 
 @app.get("/api/equity-curve")
 async def get_equity_curve(db: Session = Depends(get_db)):
+    from backend.data.kalshi_client import kalshi_credentials_present
+
+    # If Kalshi configured and live mode, build equity curve from balance snapshots or fills
+    if kalshi_credentials_present() and not settings.SIMULATION_MODE:
+        try:
+            from backend.data.kalshi_client import KalshiClient
+            client = KalshiClient()
+            balance_data = await client.get_balance()
+            balance_cents = balance_data.get("balance", 0)
+            balance_usd = balance_cents / 100.0
+            return [{
+                "timestamp": datetime.utcnow().isoformat(),
+                "pnl": balance_usd - settings.INITIAL_BANKROLL,
+                "bankroll": balance_usd,
+            }]
+        except Exception:
+            pass  # Fall through to DB curve
+
+    # Default: build from settled DB trades
     trades = db.query(Trade).filter(Trade.settled == True).order_by(Trade.timestamp).all()
 
     curve = []
@@ -627,6 +691,121 @@ async def get_calibration(db: Session = Depends(get_db)):
     return {"buckets": buckets, "summary": summary}
 
 
+# Settings endpoints
+@app.get("/api/settings")
+async def get_settings():
+    """Return current runtime configuration (no secrets in response)."""
+    from backend.data.kalshi_client import kalshi_credentials_present
+    return {
+        "simulation_mode": settings.SIMULATION_MODE,
+        "kalshi_configured": kalshi_credentials_present(),
+        "kalshi_key_id": settings.KALSHI_API_KEY_ID or "",
+        "initial_bankroll": settings.INITIAL_BANKROLL,
+        "weather_min_edge_threshold": settings.WEATHER_MIN_EDGE_THRESHOLD,
+        "weather_max_trade_size": settings.WEATHER_MAX_TRADE_SIZE,
+    }
+
+
+@app.post("/api/settings")
+async def update_settings(payload: dict):
+    """Update runtime settings and persist to .env file."""
+    import os
+
+    env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+    env_path = os.path.abspath(env_path)
+
+    # Load existing .env lines (preserve any we're not touching)
+    env_lines: dict[str, str] = {}
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    env_lines[k.strip()] = v.strip()
+
+    # Handle private key PEM
+    key_id = payload.get("key_id")
+    private_key_pem = payload.get("private_key_pem")
+
+    if key_id is not None:
+        object.__setattr__(settings, "KALSHI_API_KEY_ID", key_id or None)
+        os.environ["KALSHI_API_KEY_ID"] = key_id
+        env_lines["KALSHI_API_KEY_ID"] = key_id
+
+    if private_key_pem:
+        # Normalize newlines: handle \n literals in JSON
+        pem_text = private_key_pem.replace("\\n", "\n").strip()
+        pem_path = os.path.join(os.path.dirname(env_path), "kalshi_private_key.pem")
+        with open(pem_path, "w") as f:
+            f.write(pem_text + "\n")
+        object.__setattr__(settings, "KALSHI_PRIVATE_KEY_PATH", pem_path)
+        os.environ["KALSHI_PRIVATE_KEY_PATH"] = pem_path
+        env_lines["KALSHI_PRIVATE_KEY_PATH"] = pem_path
+
+    if "simulation_mode" in payload:
+        val = bool(payload["simulation_mode"])
+        object.__setattr__(settings, "SIMULATION_MODE", val)
+        os.environ["SIMULATION_MODE"] = str(val)
+        env_lines["SIMULATION_MODE"] = str(val)
+
+    if "initial_bankroll" in payload:
+        try:
+            val = float(payload["initial_bankroll"])
+            object.__setattr__(settings, "INITIAL_BANKROLL", val)
+            os.environ["INITIAL_BANKROLL"] = str(val)
+            env_lines["INITIAL_BANKROLL"] = str(val)
+        except (ValueError, TypeError):
+            pass
+
+    if "min_edge" in payload:
+        try:
+            val = float(payload["min_edge"])
+            object.__setattr__(settings, "WEATHER_MIN_EDGE_THRESHOLD", val)
+            os.environ["WEATHER_MIN_EDGE_THRESHOLD"] = str(val)
+            env_lines["WEATHER_MIN_EDGE_THRESHOLD"] = str(val)
+        except (ValueError, TypeError):
+            pass
+
+    if "max_trade_size" in payload:
+        try:
+            val = float(payload["max_trade_size"])
+            object.__setattr__(settings, "WEATHER_MAX_TRADE_SIZE", val)
+            os.environ["WEATHER_MAX_TRADE_SIZE"] = str(val)
+            env_lines["WEATHER_MAX_TRADE_SIZE"] = str(val)
+        except (ValueError, TypeError):
+            pass
+
+    # Write .env file
+    with open(env_path, "w") as f:
+        for k, v in env_lines.items():
+            f.write(f"{k}={v}\n")
+
+    # Reset cached private key in KalshiClient instances (they lazy-load)
+    from backend.data.kalshi_client import kalshi_credentials_present
+    return {
+        "ok": True,
+        "kalshi_configured": kalshi_credentials_present(),
+        "simulation_mode": settings.SIMULATION_MODE,
+    }
+
+
+@app.post("/api/settings/test-connection")
+async def test_kalshi_connection():
+    """Test Kalshi API connection using current credentials."""
+    from backend.data.kalshi_client import KalshiClient, kalshi_credentials_present
+
+    if not kalshi_credentials_present():
+        return {"ok": False, "error": "Kalshi credentials not configured. Set Key ID and Private Key above."}
+
+    try:
+        client = KalshiClient()
+        balance_data = await client.get_balance()
+        return {"ok": True, "balance": balance_data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 # Kalshi endpoints
 @app.get("/api/kalshi/status")
 async def get_kalshi_status():
@@ -691,65 +870,88 @@ async def get_weather_forecasts():
 
 @app.get("/api/weather/markets", response_model=List[WeatherMarketResponse])
 async def get_weather_markets():
-    """Get active weather temperature markets."""
+    """Get active weather temperature markets. Falls back to signal-derived markets if Polymarket fetch is empty."""
     if not settings.WEATHER_ENABLED:
         return []
 
+    markets = []
+
     try:
         from backend.data.weather_markets import fetch_polymarket_weather_markets
-
         city_keys = [c.strip() for c in settings.WEATHER_CITIES.split(",") if c.strip()]
         markets = await fetch_polymarket_weather_markets(city_keys)
-
-        # Also fetch Kalshi markets if enabled
-        if settings.KALSHI_ENABLED:
-            try:
-                from backend.data.kalshi_client import kalshi_credentials_present
-                from backend.data.kalshi_markets import fetch_kalshi_weather_markets
-                if kalshi_credentials_present():
-                    kalshi_markets = await fetch_kalshi_weather_markets(city_keys)
-                    markets.extend(kalshi_markets)
-            except Exception:
-                pass
-
-        return [
-            WeatherMarketResponse(
-                slug=m.slug,
-                market_id=m.market_id,
-                platform=m.platform,
-                title=m.title,
-                city_key=m.city_key,
-                city_name=m.city_name,
-                target_date=m.target_date.isoformat(),
-                threshold_f=m.threshold_f,
-                metric=m.metric,
-                direction=m.direction,
-                yes_price=m.yes_price,
-                no_price=m.no_price,
-                volume=m.volume,
-            )
-            for m in markets
-        ]
     except Exception:
-        return []
+        pass
+
+    # If Polymarket returned nothing, derive markets from signal engine (Kalshi markets)
+    if not markets:
+        try:
+            from backend.core.weather_signals import scan_for_weather_signals
+            wx_signals = await scan_for_weather_signals()
+            for s in wx_signals:
+                m = s.market
+                markets.append(WeatherMarketResponse(
+                    slug=m.slug,
+                    market_id=m.market_id,
+                    platform=m.platform,
+                    title=m.title,
+                    city_key=m.city_key,
+                    city_name=m.city_name,
+                    target_date=m.target_date.isoformat(),
+                    threshold_f=m.threshold_f,
+                    metric=m.metric,
+                    direction=m.direction,
+                    yes_price=m.yes_price,
+                    no_price=m.no_price,
+                    volume=m.volume,
+                ))
+            return markets
+        except Exception:
+            pass
+
+    return [
+        WeatherMarketResponse(
+            slug=m.slug,
+            market_id=m.market_id,
+            platform=m.platform,
+            title=m.title,
+            city_key=m.city_key,
+            city_name=m.city_name,
+            target_date=m.target_date.isoformat(),
+            threshold_f=m.threshold_f,
+            metric=m.metric,
+            direction=m.direction,
+            yes_price=m.yes_price,
+            no_price=m.no_price,
+            volume=m.volume,
+        )
+        for m in markets
+    ]
 
 
 @app.get("/api/weather/signals", response_model=List[WeatherSignalResponse])
 async def get_weather_signals():
-    """Get current weather trading signals."""
+    """Get current weather trading signals from cache (populated by background scanner)."""
     if not settings.WEATHER_ENABLED:
         return []
 
+    import logging
+    _logger = logging.getLogger("trading_bot")
     try:
-        from backend.core.weather_signals import scan_for_weather_signals
+        from backend.core.weather_signals import get_cached_signals, get_signal_cache_age_seconds
 
-        signals = await scan_for_weather_signals()
+        signals = get_cached_signals()
+        age = get_signal_cache_age_seconds()
+        _logger.info(f"Weather signals endpoint: {len(signals)} signals from cache (age: {age:.0f}s)")
         return [_weather_signal_to_response(s) for s in signals]
-    except Exception:
+    except Exception as e:
+        _logger.error(f"Weather signals endpoint error: {e}", exc_info=True)
         return []
 
 
 def _weather_signal_to_response(s) -> WeatherSignalResponse:
+    # Support both old WeatherTradingSignal (from weather_signals.py) formats
+    net_edge = getattr(s, "net_edge", s.edge)
     return WeatherSignalResponse(
         market_id=s.market.market_id,
         city_key=s.market.city_key,
@@ -760,7 +962,7 @@ def _weather_signal_to_response(s) -> WeatherSignalResponse:
         direction=s.direction,
         model_probability=s.model_probability,
         market_probability=s.market_probability,
-        edge=s.edge,
+        edge=net_edge,
         confidence=s.confidence,
         suggested_size=s.suggested_size,
         reasoning=s.reasoning,
@@ -853,35 +1055,37 @@ async def get_dashboard(db: Session = Depends(get_db)):
     stats = await get_stats(db)
 
     # Fetch BTC price from microstructure first, fallback to CoinGecko
+    # Skip if BTC is disabled to avoid hanging on dead network calls
     btc_price_data = None
     micro_data = None
-    try:
-        micro = await compute_btc_microstructure()
-        if micro:
-            micro_data = MicrostructureResponse(
-                rsi=micro.rsi,
-                momentum_1m=micro.momentum_1m,
-                momentum_5m=micro.momentum_5m,
-                momentum_15m=micro.momentum_15m,
-                vwap_deviation=micro.vwap_deviation,
-                sma_crossover=micro.sma_crossover,
-                volatility=micro.volatility,
-                price=micro.price,
-                source=micro.source,
-            )
-            btc_price_data = BtcPriceResponse(
-                price=micro.price,
-                change_24h=micro.momentum_15m * 96,  # rough extrapolation
-                change_7d=0,
-                market_cap=0,
-                volume_24h=0,
-                last_updated=datetime.utcnow(),
-            )
-    except Exception:
-        pass
-    if not btc_price_data:
+    if settings.BTC_ENABLED:
         try:
-            btc = await fetch_crypto_price("BTC")
+            micro = await asyncio.wait_for(compute_btc_microstructure(), timeout=3.0)
+            if micro:
+                micro_data = MicrostructureResponse(
+                    rsi=micro.rsi,
+                    momentum_1m=micro.momentum_1m,
+                    momentum_5m=micro.momentum_5m,
+                    momentum_15m=micro.momentum_15m,
+                    vwap_deviation=micro.vwap_deviation,
+                    sma_crossover=micro.sma_crossover,
+                    volatility=micro.volatility,
+                    price=micro.price,
+                    source=micro.source,
+                )
+                btc_price_data = BtcPriceResponse(
+                    price=micro.price,
+                    change_24h=micro.momentum_15m * 96,  # rough extrapolation
+                    change_7d=0,
+                    market_cap=0,
+                    volume_24h=0,
+                    last_updated=datetime.utcnow(),
+                )
+        except Exception:
+            pass
+    if not btc_price_data and settings.BTC_ENABLED:
+        try:
+            btc = await asyncio.wait_for(fetch_crypto_price("BTC"), timeout=3.0)
             if btc:
                 btc_price_data = BtcPriceResponse(
                     price=btc.current_price,
@@ -894,36 +1098,38 @@ async def get_dashboard(db: Session = Depends(get_db)):
         except Exception:
             pass
 
-    # Fetch windows
+    # Fetch windows (only when BTC enabled)
     windows = []
-    try:
-        markets = await fetch_active_btc_markets()
-        windows = [
-            BtcWindowResponse(
-                slug=m.slug,
-                market_id=m.market_id,
-                up_price=m.up_price,
-                down_price=m.down_price,
-                window_start=m.window_start,
-                window_end=m.window_end,
-                volume=m.volume,
-                is_active=m.is_active,
-                is_upcoming=m.is_upcoming,
-                time_until_end=m.time_until_end,
-                spread=m.spread,
-            )
-            for m in markets
-        ]
-    except Exception:
-        pass
+    if settings.BTC_ENABLED:
+        try:
+            markets = await asyncio.wait_for(fetch_active_btc_markets(), timeout=3.0)
+            windows = [
+                BtcWindowResponse(
+                    slug=m.slug,
+                    market_id=m.market_id,
+                    up_price=m.up_price,
+                    down_price=m.down_price,
+                    window_start=m.window_start,
+                    window_end=m.window_end,
+                    volume=m.volume,
+                    is_active=m.is_active,
+                    is_upcoming=m.is_upcoming,
+                    time_until_end=m.time_until_end,
+                    spread=m.spread,
+                )
+                for m in markets
+            ]
+        except Exception:
+            pass
 
-    # Signals — return ALL signals, mark which are actionable
+    # Signals — return BTC signals only if BTC is enabled
     signals = []
-    try:
-        raw_signals = await scan_for_signals()
-        signals = [_signal_to_response(s, actionable=s.passes_threshold) for s in raw_signals]
-    except Exception:
-        pass
+    if settings.BTC_ENABLED:
+        try:
+            raw_signals = await scan_for_signals()
+            signals = [_signal_to_response(s, actionable=s.passes_threshold) for s in raw_signals]
+        except Exception:
+            pass
 
     # Recent trades
     trades = db.query(Trade).order_by(Trade.timestamp.desc()).limit(50).all()
@@ -965,29 +1171,11 @@ async def get_dashboard(db: Session = Depends(get_db)):
     weather_forecasts_data = []
     if settings.WEATHER_ENABLED:
         try:
-            from backend.core.weather_signals import scan_for_weather_signals
-            from backend.data.weather import fetch_ensemble_forecast, CITY_CONFIG
+            from backend.core.weather_signals import get_cached_signals, get_signal_cache_age_seconds
 
-            wx_signals = await scan_for_weather_signals()
+            # Serve from cache — fresh scan runs in background scheduler every 5min
+            wx_signals = get_cached_signals()
             weather_signals_data = [_weather_signal_to_response(s) for s in wx_signals]
-
-            city_keys = [c.strip() for c in settings.WEATHER_CITIES.split(",") if c.strip()]
-            for city_key in city_keys:
-                if city_key not in CITY_CONFIG:
-                    continue
-                forecast = await fetch_ensemble_forecast(city_key)
-                if forecast:
-                    weather_forecasts_data.append(WeatherForecastResponse(
-                        city_key=forecast.city_key,
-                        city_name=forecast.city_name,
-                        target_date=forecast.target_date.isoformat(),
-                        mean_high=forecast.mean_high,
-                        std_high=forecast.std_high,
-                        mean_low=forecast.mean_low,
-                        std_low=forecast.std_low,
-                        num_members=forecast.num_members,
-                        ensemble_agreement=forecast.ensemble_agreement,
-                    ))
         except Exception:
             pass
 
@@ -1013,7 +1201,7 @@ async def websocket_events(websocket: WebSocket):
         await websocket.send_json({
             "timestamp": datetime.utcnow().isoformat(),
             "type": "success",
-            "message": "Connected to BTC trading bot"
+            "message": "Connected to Weather Edge"
         })
 
         from backend.core.scheduler import get_recent_events
@@ -1042,6 +1230,27 @@ async def websocket_events(websocket: WebSocket):
         ws_manager.disconnect(websocket)
 
 
+# Serve pre-built frontend from frontend/dist
+from pathlib import Path
+_FRONTEND_DIST = (Path(__file__).parent / ".." / ".." / "frontend" / "dist").resolve()
+if _FRONTEND_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIST / "assets")), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_index():
+        return FileResponse(str(_FRONTEND_DIST / "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):
+        # Don't intercept /api or /ws routes
+        if full_path.startswith("api/") or full_path.startswith("ws"):
+            raise HTTPException(status_code=404)
+        index = _FRONTEND_DIST / "index.html"
+        if not index.exists():
+            raise HTTPException(status_code=404, detail="Frontend not built")
+        return FileResponse(str(index))
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", "8000")))

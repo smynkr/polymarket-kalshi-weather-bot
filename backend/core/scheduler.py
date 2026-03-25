@@ -227,7 +227,7 @@ async def weather_scan_and_trade_job():
             ).scalar()
 
             if weather_pending >= MAX_WEATHER_ALLOCATION:
-                log_event("info", f"Weather allocation limit reached: ${weather_pending:.0f}/${MAX_WEATHER_ALLOCATION:.0f}")
+                # Silently skip — allocation limit enforced without log noise
                 return
 
             trades_executed = 0
@@ -255,7 +255,7 @@ async def weather_scan_and_trade_job():
 
                 trade = Trade(
                     market_ticker=signal.market.market_id,
-                    platform="polymarket",
+                    platform="kalshi",
                     event_slug=signal.market.slug,
                     market_type="weather",
                     direction=signal.direction,
@@ -316,8 +316,10 @@ async def settlement_job():
     """
     Background job: Check and settle pending trades.
     Runs every 2 minutes (BTC 5-min markets resolve fast).
+    Also handles weather trade settlement when WEATHER_ENABLED.
     """
-    log_event("info", "Checking BTC trade settlements...")
+    # BTC_ENABLED=False only disables BTC scanning, NOT settlement
+    # Weather trades also need to settle, so never skip entirely
 
     try:
         from backend.core.settlement import settle_pending_trades, update_bot_state_with_settlements
@@ -399,14 +401,17 @@ def start_scheduler():
     scan_seconds = settings.SCAN_INTERVAL_SECONDS
     settle_seconds = settings.SETTLEMENT_INTERVAL_SECONDS
 
-    # Scan BTC markets every minute
-    scheduler.add_job(
-        scan_and_trade_job,
-        IntervalTrigger(seconds=scan_seconds),
-        id="market_scan",
-        replace_existing=True,
-        max_instances=1
-    )
+    # Scan BTC markets every minute (gated by BTC_ENABLED)
+    if settings.BTC_ENABLED:
+        scheduler.add_job(
+            scan_and_trade_job,
+            IntervalTrigger(seconds=scan_seconds),
+            id="market_scan",
+            replace_existing=True,
+            max_instances=1
+        )
+    else:
+        log_event("info", "BTC trading DISABLED (BTC_ENABLED=False) — weather-only mode")
 
     # Check settlements every 2 minutes
     scheduler.add_job(
@@ -440,14 +445,16 @@ def start_scheduler():
         )
 
     scheduler.start()
-    log_event("success", "BTC 5-min trading scheduler started", {
+    log_event("success", "Weather Edge scheduler started", {
+        "btc_enabled": settings.BTC_ENABLED,
         "scan_interval": f"{scan_seconds}s",
         "settlement_interval": f"{settle_seconds}s",
         "min_edge": f"{settings.MIN_EDGE_THRESHOLD:.0%}",
         "weather_enabled": settings.WEATHER_ENABLED,
     })
 
-    asyncio.create_task(scan_and_trade_job())
+    if settings.BTC_ENABLED:
+        asyncio.create_task(scan_and_trade_job())
 
     if settings.WEATHER_ENABLED:
         asyncio.create_task(weather_scan_and_trade_job())
