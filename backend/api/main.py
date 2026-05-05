@@ -1,5 +1,5 @@
 """FastAPI backend for BTC 5-min trading bot dashboard."""
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -9,6 +9,8 @@ from typing import List, Optional
 import asyncio
 import json
 import os
+import stat
+import tempfile
 
 from backend.config import settings
 from backend.models.database import (
@@ -58,6 +60,63 @@ class ConnectionManager:
 
 
 ws_manager = ConnectionManager()
+
+
+DEFAULT_LIVE_DATA = {
+    "kalshi": {
+        "balance": 0.0,
+        "portfolio_value": 0.0,
+        "total": 0.0,
+        "positions": [],
+        "resting_orders": [],
+        "last_live_trade_ts": "",
+        "error": None,
+    },
+    "polymarket": {
+        "balance": 0.0,
+        "position_value": 0.0,
+        "total": 0.0,
+        "positions": [],
+        "last_live_trade_ts": "",
+        "dry_run_warning": False,
+        "error": None,
+    },
+    "lifetime": {
+        "lifetime_pnl": 0.0,
+        "kalshi_lifetime_pnl": 0.0,
+        "poly_lifetime_pnl": 0.0,
+        "total_deposited": 0.0,
+        "kalshi_deposited": 0.0,
+        "poly_deposited": 0.0,
+        "current_total": 0.0,
+        "today_spent": 0.0,
+        "error": None,
+    },
+}
+
+
+def _get_or_create_bot_state(db: Session) -> BotState:
+    state = db.query(BotState).first()
+    if not state:
+        state = BotState(
+            bankroll=settings.INITIAL_BANKROLL,
+            total_trades=0,
+            winning_trades=0,
+            total_pnl=0.0,
+            is_running=False,
+        )
+        db.add(state)
+        db.commit()
+        db.refresh(state)
+    return state
+
+
+def _log_event(event_type: str, message: str, data: Optional[dict] = None) -> None:
+    try:
+        from backend.core.scheduler import log_event
+        log_event(event_type, message, data or {})
+    except ModuleNotFoundError:
+        return
 
 
 # Pydantic response models
@@ -291,6 +350,22 @@ async def root():
 @app.get("/api/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/api/data")
+async def get_live_data(db: Session = Depends(get_db)):
+    state = _get_or_create_bot_state(db)
+    return {
+        "ts": datetime.utcnow().isoformat(),
+        **DEFAULT_LIVE_DATA,
+        "metar_lines": [],
+        "metar_poly_lines": [],
+        "metar_v2_signals": [],
+        "system": {
+            "services": [{"label": "Weather Edge", "running": bool(state.is_running)}],
+            "socks_up": False,
+        },
+    }
 
 
 @app.get("/api/stats", response_model=BotStats)
@@ -706,23 +781,61 @@ async def get_settings():
     }
 
 
+def _is_loopback_client(request: Request) -> bool:
+    if request.client is None:
+        return False
+    return request.client.host in {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _upsert_env_value_preserving_lines(lines: list[str], key: str, value: str) -> list[str]:
+    updated = False
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped.startswith("#") and "=" in stripped:
+            existing_key = stripped.partition("=")[0].strip()
+            if existing_key == key:
+                newline = "\n" if line.endswith("\n") else ""
+                new_lines.append(f"{key}={value}{newline}")
+                updated = True
+                continue
+        new_lines.append(line)
+    if not updated:
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] = new_lines[-1] + "\n"
+        new_lines.append(f"{key}={value}\n")
+    return new_lines
+
+
+def _write_text_atomic(path: str, lines: list[str]) -> None:
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".env.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(lines)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 @app.post("/api/settings")
-async def update_settings(payload: dict):
+async def update_settings(payload: dict, request: Request):
     """Update runtime settings and persist to .env file."""
     import os
 
     env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
     env_path = os.path.abspath(env_path)
 
-    # Load existing .env lines (preserve any we're not touching)
-    env_lines: dict[str, str] = {}
+    credential_write_requested = payload.get("key_id") is not None or bool(payload.get("private_key_pem"))
+    if credential_write_requested and not _is_loopback_client(request):
+        raise HTTPException(status_code=403, detail="Credential updates are allowed only from localhost")
+
+    # Load existing .env lines (preserve comments, ordering, and untouched content)
+    env_lines: list[str] = []
     if os.path.exists(env_path):
         with open(env_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    env_lines[k.strip()] = v.strip()
+            env_lines = f.readlines()
 
     # Handle private key PEM
     key_id = payload.get("key_id")
@@ -731,30 +844,32 @@ async def update_settings(payload: dict):
     if key_id is not None:
         object.__setattr__(settings, "KALSHI_API_KEY_ID", key_id or None)
         os.environ["KALSHI_API_KEY_ID"] = key_id
-        env_lines["KALSHI_API_KEY_ID"] = key_id
+        env_lines = _upsert_env_value_preserving_lines(env_lines, "KALSHI_API_KEY_ID", key_id)
 
     if private_key_pem:
         # Normalize newlines: handle \n literals in JSON
         pem_text = private_key_pem.replace("\\n", "\n").strip()
         pem_path = os.path.join(os.path.dirname(env_path), "kalshi_private_key.pem")
-        with open(pem_path, "w") as f:
+        fd = os.open(pem_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(pem_text + "\n")
+        os.chmod(pem_path, stat.S_IRUSR | stat.S_IWUSR)
         object.__setattr__(settings, "KALSHI_PRIVATE_KEY_PATH", pem_path)
         os.environ["KALSHI_PRIVATE_KEY_PATH"] = pem_path
-        env_lines["KALSHI_PRIVATE_KEY_PATH"] = pem_path
+        env_lines = _upsert_env_value_preserving_lines(env_lines, "KALSHI_PRIVATE_KEY_PATH", pem_path)
 
     if "simulation_mode" in payload:
         val = bool(payload["simulation_mode"])
         object.__setattr__(settings, "SIMULATION_MODE", val)
         os.environ["SIMULATION_MODE"] = str(val)
-        env_lines["SIMULATION_MODE"] = str(val)
+        env_lines = _upsert_env_value_preserving_lines(env_lines, "SIMULATION_MODE", str(val))
 
     if "initial_bankroll" in payload:
         try:
             val = float(payload["initial_bankroll"])
             object.__setattr__(settings, "INITIAL_BANKROLL", val)
             os.environ["INITIAL_BANKROLL"] = str(val)
-            env_lines["INITIAL_BANKROLL"] = str(val)
+            env_lines = _upsert_env_value_preserving_lines(env_lines, "INITIAL_BANKROLL", str(val))
         except (ValueError, TypeError):
             pass
 
@@ -763,7 +878,7 @@ async def update_settings(payload: dict):
             val = float(payload["min_edge"])
             object.__setattr__(settings, "WEATHER_MIN_EDGE_THRESHOLD", val)
             os.environ["WEATHER_MIN_EDGE_THRESHOLD"] = str(val)
-            env_lines["WEATHER_MIN_EDGE_THRESHOLD"] = str(val)
+            env_lines = _upsert_env_value_preserving_lines(env_lines, "WEATHER_MIN_EDGE_THRESHOLD", str(val))
         except (ValueError, TypeError):
             pass
 
@@ -772,14 +887,12 @@ async def update_settings(payload: dict):
             val = float(payload["max_trade_size"])
             object.__setattr__(settings, "WEATHER_MAX_TRADE_SIZE", val)
             os.environ["WEATHER_MAX_TRADE_SIZE"] = str(val)
-            env_lines["WEATHER_MAX_TRADE_SIZE"] = str(val)
+            env_lines = _upsert_env_value_preserving_lines(env_lines, "WEATHER_MAX_TRADE_SIZE", str(val))
         except (ValueError, TypeError):
             pass
 
     # Write .env file
-    with open(env_path, "w") as f:
-        for k, v in env_lines.items():
-            f.write(f"{k}={v}\n")
+    _write_text_atomic(env_path, env_lines)
 
     # Reset cached private key in KalshiClient instances (they lazy-load)
     from backend.data.kalshi_client import kalshi_credentials_present
@@ -866,6 +979,71 @@ async def get_weather_forecasts():
         return forecasts
     except Exception:
         return []
+
+
+@app.get("/api/kalshi/markets")
+async def get_kalshi_markets():
+    if not settings.WEATHER_ENABLED:
+        return {"markets": [], "count": 0, "traded_today_count": 0}
+    try:
+        from backend.data.kalshi_markets import fetch_kalshi_weather_markets
+        city_keys = [c.strip() for c in settings.WEATHER_CITIES.split(",") if c.strip()]
+        markets = await fetch_kalshi_weather_markets(city_keys)
+    except Exception:
+        markets = []
+    return {"markets": [_market_to_frontend(m) for m in markets], "count": len(markets), "traded_today_count": 0}
+
+
+@app.get("/api/polymarket/markets")
+async def get_polymarket_markets():
+    if not settings.WEATHER_ENABLED:
+        return {"markets": [], "count": 0}
+    try:
+        from backend.data.weather_markets import fetch_polymarket_weather_markets
+        city_keys = [c.strip() for c in settings.WEATHER_CITIES.split(",") if c.strip()]
+        markets = await fetch_polymarket_weather_markets(city_keys)
+    except Exception:
+        markets = []
+    return {"markets": [_market_to_frontend(m) for m in markets], "count": len(markets)}
+
+
+def _market_to_frontend(m) -> dict:
+    return {
+        "condition_id": getattr(m, "market_id", ""),
+        "city": getattr(m, "city_name", ""),
+        "question": getattr(m, "title", ""),
+        "side": getattr(m, "direction", ""),
+        "price": getattr(m, "yes_price", None),
+        "bet_usd": None,
+        "metar_temp_f": None,
+        "threshold": str(getattr(m, "threshold_f", "")),
+        "score": None,
+        "score_desc": None,
+        "dry_run": settings.SIMULATION_MODE,
+        "order_success": False,
+        "order_id": "",
+        "ts": datetime.utcnow().isoformat(),
+        "status": "scanned",
+        "roi_pct": None,
+        "current_price": getattr(m, "yes_price", None),
+        "current_pnl": None,
+        "position_size": None,
+        "trigger": getattr(m, "metric", ""),
+        "threshold_raw": str(getattr(m, "threshold_f", "")),
+        "current_temp_f": None,
+        "peak_temp_f": None,
+        "confidence": None,
+        "raw_price": getattr(m, "yes_price", None),
+        "filtered_prob": None,
+        "ev_net": None,
+        "ev_gross": None,
+        "uncertainty": None,
+        "recommend": False,
+        "flagged_informed": False,
+        "is_traded": False,
+        "v1": None,
+        "v2": None,
+    }
 
 
 @app.get("/api/weather/markets", response_model=List[WeatherMarketResponse])
@@ -991,30 +1169,28 @@ async def get_events(limit: int = 50):
 # Bot control
 @app.post("/api/bot/start")
 async def start_bot(db: Session = Depends(get_db)):
-    from backend.core.scheduler import start_scheduler, log_event, is_scheduler_running
+    state = _get_or_create_bot_state(db)
+    state.is_running = True
+    db.commit()
 
-    state = db.query(BotState).first()
-    if state:
-        state.is_running = True
-        db.commit()
+    try:
+        from backend.core.scheduler import start_scheduler, is_scheduler_running
+        if not is_scheduler_running():
+            start_scheduler()
+    except ModuleNotFoundError:
+        pass
 
-    if not is_scheduler_running():
-        start_scheduler()
-
-    log_event("success", "Trading bot started")
+    _log_event("success", "Trading bot started")
     return {"status": "started", "is_running": True}
 
 
 @app.post("/api/bot/stop")
 async def stop_bot(db: Session = Depends(get_db)):
-    from backend.core.scheduler import log_event
+    state = _get_or_create_bot_state(db)
+    state.is_running = False
+    db.commit()
 
-    state = db.query(BotState).first()
-    if state:
-        state.is_running = False
-        db.commit()
-
-    log_event("info", "Trading bot paused")
+    _log_event("info", "Trading bot paused")
     return {"status": "stopped", "is_running": False}
 
 
@@ -1253,4 +1429,4 @@ if _FRONTEND_DIST.is_dir():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", "8765")))
