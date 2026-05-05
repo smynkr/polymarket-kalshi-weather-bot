@@ -125,6 +125,161 @@ export interface WeatherSignal {
   platform?: string
 }
 
+export interface KalshiPosition {
+  ticker: string
+  contracts: number
+  value: number
+  cost: number
+  unrealized_pnl: number
+  realized_pnl: number
+  side: string
+  payout_if_win: number
+  placed_ts: string
+}
+
+export interface KalshiData {
+  balance: number
+  portfolio_value: number
+  total: number
+  positions: KalshiPosition[]
+  resting_orders: any[]
+  last_live_trade_ts: string
+  error: string | null
+}
+
+export interface PolyPosition {
+  market: string
+  title: string
+  outcome: string
+  token_id: string
+  size: number
+  avg_price: number
+  current_price: number
+  pnl: number
+  coldmath: boolean
+  new_trade: boolean
+  placed_ts: string
+  garbage: boolean
+  unattributed: boolean
+}
+
+export interface PolyData {
+  balance: number
+  position_value: number
+  total: number
+  positions: PolyPosition[]
+  last_live_trade_ts: string
+  dry_run_warning: boolean
+  error: string | null
+}
+
+export interface LifetimeData {
+  lifetime_pnl: number
+  kalshi_lifetime_pnl: number
+  poly_lifetime_pnl: number
+  total_deposited: number
+  kalshi_deposited: number
+  poly_deposited: number
+  current_total: number
+  today_spent: number
+  error?: string | null
+}
+
+export interface MetarV2Signal {
+  ts: string
+  city: string
+  icao: string
+  condition_id: string
+  question: string
+  threshold_type: string
+  threshold_raw: string
+  v1: number
+  v2: number | null
+  side: string
+  raw_temp_f: number
+  peak_temp_f: number
+  confidence: number
+  raw_price: number
+  microprice: number | null
+  spread: number
+  depth: number
+  order_imbalance: number | null
+  info_velocity: number
+  ev_gross: number
+  ev_net: number
+  breakeven_q: number
+  filtered_prob: number
+  uncertainty: number
+  flagged_informed: boolean
+  recommend: boolean
+  dry_run: boolean
+}
+
+export interface SystemStatus {
+  services: { label: string; running: boolean }[]
+  socks_up: boolean
+}
+
+export interface LiveData {
+  ts: string
+  kalshi: KalshiData
+  polymarket: PolyData
+  lifetime: LifetimeData
+  metar_lines: string[]
+  metar_poly_lines: string[]
+  metar_v2_signals: MetarV2Signal[]
+  system: SystemStatus
+}
+
+export interface KalshiMarket {
+  condition_id: string
+  city: string
+  question: string
+  side: string
+  threshold_raw: string
+  current_temp_f: number | null
+  peak_temp_f: number | null
+  confidence: number | null
+  raw_price: number | null
+  filtered_prob: number | null
+  ev_net: number | null
+  ev_gross: number | null
+  uncertainty: number | null
+  recommend: boolean
+  flagged_informed: boolean
+  dry_run: boolean
+  is_traded: boolean
+  status: 'bet_placed' | 'watching_hot' | 'watching' | 'flagged' | 'neutral'
+  trigger: string
+  roi_pct: number | null
+  v1: number | null
+  v2: number | null
+  ts: string
+}
+
+export interface PolyMarket {
+  condition_id: string
+  city: string
+  question: string
+  side: string
+  price: number | null
+  bet_usd: number | null
+  metar_temp_f: number | null
+  threshold: string
+  score: number | null
+  score_desc: string | null
+  dry_run: boolean
+  order_success: boolean
+  order_id: string
+  ts: string
+  status: 'holding' | 'bet_placed' | 'scanned' | 'dry_run'
+  roi_pct: number | null
+  current_price: number | null
+  current_pnl: number | null
+  position_size: number | null
+  trigger: string
+}
+
 export interface DashboardData {
   stats: BotStats
   btc_price: BtcPrice | null

@@ -12,6 +12,8 @@ Supports rain, temperature_high, temperature_low, snow markets for 200+ tickers.
 """
 import asyncio
 import logging
+import os
+import pickle
 import re
 import time
 import requests
@@ -119,9 +121,64 @@ _metar_cache: dict = {}          # key -> (timestamp, data)
 _ENSEMBLE_CACHE_TTL = 10800      # 3 hours — GFS data is stable
 _METAR_CACHE_TTL = 1800          # 30 minutes — METAR is real-time
 
+# Disk cache path — survives restarts
+_DISK_CACHE_PATH = os.path.join(os.path.dirname(__file__), "../../../../.ensemble_cache.pkl")
+_DISK_CACHE_PATH = os.path.abspath(_DISK_CACHE_PATH)
+
+# Quota circuit breaker — tracks 429s per UTC day
+# If we hit too many 429s, stop fetching until midnight UTC resets the quota
+_quota_exhausted_date: Optional[str] = None   # "YYYY-MM-DD" if exhausted today
+_consecutive_429s: int = 0
+_MAX_CONSECUTIVE_429S = 3  # after this many in a row, mark quota exhausted
+
 # Result cache — populated by scheduler, served instantly to dashboard
 _last_signal_results: list = []
 _last_signal_timestamp: float = 0.0
+
+
+def _load_disk_cache():
+    """Load ensemble cache from disk on startup to survive restarts."""
+    global _ensemble_cache
+    try:
+        if os.path.exists(_DISK_CACHE_PATH):
+            with open(_DISK_CACHE_PATH, "rb") as f:
+                loaded = pickle.load(f)
+            # Only keep entries that haven't expired
+            now = time.time()
+            valid = {k: v for k, v in loaded.items() if now - v[0] < _ENSEMBLE_CACHE_TTL}
+            _ensemble_cache = valid
+            if valid:
+                logger.info(f"Loaded {len(valid)} ensemble cache entries from disk")
+    except Exception as e:
+        logger.warning(f"Failed to load disk cache: {e}")
+        _ensemble_cache = {}
+
+
+def _save_disk_cache():
+    """Persist ensemble cache to disk."""
+    try:
+        with open(_DISK_CACHE_PATH, "wb") as f:
+            pickle.dump(_ensemble_cache, f)
+    except Exception as e:
+        logger.warning(f"Failed to save disk cache: {e}")
+
+
+def _is_quota_exhausted() -> bool:
+    """Return True if open-meteo quota is exhausted for today (UTC)."""
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _quota_exhausted_date == today_utc
+
+
+def _mark_quota_exhausted():
+    global _quota_exhausted_date
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _quota_exhausted_date != today_utc:
+        logger.warning(f"open-meteo quota exhausted for {today_utc} — suspending GFS fetches until midnight UTC")
+        _quota_exhausted_date = today_utc
+
+
+# Load disk cache on module import
+_load_disk_cache()
 
 
 def get_cached_signals() -> list:
@@ -453,17 +510,24 @@ def parse_market_type(market: dict) -> dict:
 # ─── GFS ENSEMBLE FETCHING ──────────────────────────────────────────────────────
 
 _last_openmeteo_request = 0.0
-_OPENMETEO_MIN_INTERVAL = 1.0  # seconds between requests
+_OPENMETEO_MIN_INTERVAL = 1.5  # seconds between requests (slightly more conservative)
 
 def fetch_ensemble(lat: float, lon: float, target_date: date) -> Optional[dict]:
-    """Fetch 31-member GFS ensemble from open-meteo. Cached by (lat, lon)."""
-    global _last_openmeteo_request
+    """Fetch 31-member GFS ensemble from open-meteo. Cached by (lat, lon) with disk persistence."""
+    global _last_openmeteo_request, _consecutive_429s
 
     cache_key = (round(lat, 2), round(lon, 2))
+
+    # Return from in-memory cache if fresh
     if cache_key in _ensemble_cache:
         cached_ts, cached_data = _ensemble_cache[cache_key]
         if time.time() - cached_ts < _ENSEMBLE_CACHE_TTL:
             return cached_data
+
+    # Quota circuit breaker — don't fetch if exhausted today
+    if _is_quota_exhausted():
+        logger.debug(f"Quota exhausted, skipping open-meteo fetch for ({lat},{lon})")
+        return None
 
     # Rate limit: enforce minimum gap between requests
     now = time.time()
@@ -488,12 +552,23 @@ def fetch_ensemble(lat: float, lon: float, target_date: date) -> Optional[dict]:
     try:
         resp = requests.get(ENSEMBLE_BASE, params=params, timeout=30)
         if resp.status_code == 429:
-            logger.warning(f"open-meteo rate limited, backing off 10s for ({lat},{lon})")
-            time.sleep(10)
+            _consecutive_429s += 1
+            logger.warning(f"open-meteo HTTP 429 for ({lat},{lon}) — consecutive: {_consecutive_429s}/{_MAX_CONSECUTIVE_429S}")
+            if _consecutive_429s >= _MAX_CONSECUTIVE_429S:
+                _mark_quota_exhausted()
+                return None
+            time.sleep(15)
             resp = requests.get(ENSEMBLE_BASE, params=params, timeout=30)
+            if resp.status_code == 429:
+                _consecutive_429s += 1
+                if _consecutive_429s >= _MAX_CONSECUTIVE_429S:
+                    _mark_quota_exhausted()
+                return None
         if resp.status_code != 200:
             logger.warning(f"open-meteo HTTP {resp.status_code} for ({lat},{lon})")
             return None
+        # Successful fetch — reset 429 counter
+        _consecutive_429s = 0
 
         data = resp.json()
         hourly = data.get("hourly", {})
@@ -542,6 +617,7 @@ def fetch_ensemble(lat: float, lon: float, target_date: date) -> Optional[dict]:
             }
 
         _ensemble_cache[cache_key] = (time.time(), result)
+        _save_disk_cache()
         return result
 
     except Exception as e:
@@ -593,7 +669,14 @@ def compute_probability(ensemble_data: dict, target_date: date, market_info: dic
         return {"prob": yes_count / len(vals), "mean": mean_val, "std": std_val, "n": len(vals)}
 
     elif mtype == "temperature_high":
-        # Kalshi KXHIGHT markets: "Will the max temp be <X°?" → YES = temp BELOW threshold
+        # Kalshi KXHIGHT markets: "Will the max temp be X°F or higher?" →
+        # YES = max temp AT OR ABOVE threshold. Prior version had this
+        # inverted (YES = below) — comment AND implementation both wrong.
+        # Fixed 2026-04-20 after the inversion sweep that also turned up
+        # the copy-trader inversion. Confirmed against internal metar_v3
+        # historical_base_rate strategy: NO buys at $0.4-0.6 consistently
+        # settle at $0.99 (NO wins), meaning the market resolves "high
+        # did NOT reach threshold" → NO territory, i.e. YES = at/above.
         threshold_c = market_info.get("threshold_c")
         if threshold_c is None:
             return None
@@ -601,14 +684,17 @@ def compute_probability(ensemble_data: dict, target_date: date, market_info: dic
         if not vals:
             return None
         threshold_f = market_info.get("threshold_f", threshold_c * 9/5 + 32)
-        yes_count = sum(1 for v in vals if v < threshold_f)  # YES = below threshold
+        yes_count = sum(1 for v in vals if v >= threshold_f)  # YES = at/above threshold
         mean_val = sum(vals) / len(vals)
         variance = sum((v - mean_val) ** 2 for v in vals) / len(vals)
         std_val = variance ** 0.5
         return {"prob": yes_count / len(vals), "mean": mean_val, "std": std_val, "n": len(vals)}
 
     elif mtype == "temperature_low":
-        # Kalshi KXLOWT markets: "Will the low temp be <X°?" → YES = temp BELOW threshold
+        # Kalshi KXLOWT markets: "Will the low temp be X°F or lower?" →
+        # YES = min temp AT OR BELOW threshold. Changed from strict `<` to
+        # `<=` 2026-04-20 to match the inclusive Kalshi boundary + the
+        # v2.3 Gumroad zip semantics.
         threshold_c = market_info.get("threshold_c")
         if threshold_c is None:
             return None
@@ -616,7 +702,7 @@ def compute_probability(ensemble_data: dict, target_date: date, market_info: dic
         if not vals:
             return None
         threshold_f = market_info.get("threshold_f", threshold_c * 9/5 + 32)
-        yes_count = sum(1 for v in vals if v < threshold_f)  # YES = below threshold
+        yes_count = sum(1 for v in vals if v <= threshold_f)  # YES = at/below threshold
         mean_val = sum(vals) / len(vals)
         variance = sum((v - mean_val) ** 2 for v in vals) / len(vals)
         std_val = variance ** 0.5
@@ -726,8 +812,12 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
                     p_final = p_metar
                     signal_source = "METAR-lock"
                 elif p_metar is not None and confidence == "medium":
-                    p_final = p_metar
+                    # METAR-early = GFS projection, not a physical lock.
+                    # Show as informational context only — do NOT trade on this.
                     signal_source = "METAR-early"
+                    p_final = p_metar
+                    # Force below edge threshold so it never appears as actionable
+                    # (will still appear in dashboard as a "watch" signal)
 
         kalshi_prob = item["kalshi_prob"]
         edge = p_final - kalshi_prob
@@ -741,21 +831,23 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
             direction = "no"
             entry_price = 1 - kalshi_prob
 
-        # Simple position sizing: flat $50 for clear edge, $25 for marginal
-        if abs(net_edge) > EDGE_THRESHOLD:
+        # METAR-early signals are never tradeable — GFS projection only, not a physical lock
+        if signal_source == "METAR-early":
+            suggested_size = 0.0
+        elif abs(net_edge) > EDGE_THRESHOLD:
             suggested_size = min(settings.WEATHER_MAX_TRADE_SIZE, bankroll * 0.01)
         else:
             suggested_size = min(settings.WEATHER_MAX_TRADE_SIZE * 0.5, bankroll * 0.005)
 
         # Kelly fraction estimate
-        kelly_fraction = min(0.1, abs(net_edge) * 0.5)
+        kelly_fraction = 0.0 if signal_source == "METAR-early" else min(0.1, abs(net_edge) * 0.5)
 
-        # Confidence: based on ensemble agreement and signal source
+        # Confidence: based on signal source
         agreement = max(p_final, 1 - p_final)
         if signal_source == "METAR-lock":
             confidence = 0.95
         elif signal_source == "METAR-early":
-            confidence = 0.75
+            confidence = 0.0   # not actionable — shown in dashboard as monitor-only
         else:
             confidence = min(0.85, 0.4 + agreement * 0.5)
 
