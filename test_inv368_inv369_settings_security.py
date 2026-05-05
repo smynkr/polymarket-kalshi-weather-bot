@@ -32,8 +32,16 @@ def _point_settings_endpoint_at_tmp_env(monkeypatch, tmp_path: Path) -> Path:
     return tmp_path / ".env"
 
 
+def _assert_settings_paths_are_tmp(env_path: Path, tmp_path: Path) -> None:
+    """Fail closed before settings POSTs can write outside pytest tmp_path."""
+    assert env_path.resolve().is_relative_to(tmp_path.resolve())
+    pem_path = env_path.parent / "kalshi_private_key.pem"
+    assert pem_path.resolve().is_relative_to(tmp_path.resolve())
+
+
 def test_inv369_remote_client_cannot_write_kalshi_credentials(monkeypatch, tmp_path):
     env_path = _point_settings_endpoint_at_tmp_env(monkeypatch, tmp_path)
+    _assert_settings_paths_are_tmp(env_path, tmp_path)
     env_path.write_text("UNCHANGED=value\n")
 
     previous_key_id = main.settings.KALSHI_API_KEY_ID
@@ -57,6 +65,7 @@ def test_inv369_remote_client_cannot_write_kalshi_credentials(monkeypatch, tmp_p
 
 def test_inv369_local_credential_write_preserves_env_content_uses_0600_and_redacts_response(monkeypatch, tmp_path):
     env_path = _point_settings_endpoint_at_tmp_env(monkeypatch, tmp_path)
+    _assert_settings_paths_are_tmp(env_path, tmp_path)
     env_path.write_text(
         "# keep this comment\n"
         "UNRELATED=value with spaces\n"
@@ -66,6 +75,8 @@ def test_inv369_local_credential_write_preserves_env_content_uses_0600_and_redac
     )
     monkeypatch.setattr(main.settings, "KALSHI_API_KEY_ID", None)
     monkeypatch.setattr(main.settings, "KALSHI_PRIVATE_KEY_PATH", None)
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", "")
 
     pem = "-----BEGIN PRIVATE KEY-----\nLOCAL-SECRET\n-----END PRIVATE KEY-----"
     client = TestClient(app, client=("127.0.0.1", 12345))
@@ -90,6 +101,7 @@ def test_inv369_local_credential_write_preserves_env_content_uses_0600_and_redac
     assert "key_id" not in body
 
     pem_path = tmp_path / "kalshi_private_key.pem"
+    assert pem_path.resolve().is_relative_to(tmp_path.resolve())
     assert pem_path.read_text() == pem + "\n"
     assert stat.S_IMODE(os.stat(pem_path).st_mode) == 0o600
 
