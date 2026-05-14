@@ -243,7 +243,14 @@ class WeatherTradingSignal:
 
     @property
     def passes_threshold(self) -> bool:
-        return abs(self.net_edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD
+        # INV-411: positive edge only — negative edge signals must not trade
+        if self.net_edge < settings.WEATHER_MIN_EDGE_THRESHOLD:
+            return False
+        # INV-418: entry price cap — don't enter if too expensive
+        entry_price = self.market_probability if self.direction == "yes" else (1 - self.market_probability)
+        if entry_price > settings.WEATHER_MAX_ENTRY_PRICE:
+            return False
+        return True
 
 
 # ─── UTILITY FUNCTIONS ───────────────────────────────────────────────────────────

@@ -781,10 +781,34 @@ async def get_settings():
     }
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+_LOOPBACK_ORIGINS = {
+    "http://localhost", "https://localhost",
+    "http://127.0.0.1", "https://127.0.0.1",
+    "null",
+}
+
+
 def _is_loopback_client(request: Request) -> bool:
     if request.client is None:
         return False
-    return request.client.host in {"127.0.0.1", "::1", "localhost", "testclient"}
+    return request.client.host in _LOOPBACK_HOSTS
+
+
+def _require_loopback_mutation(request: Request) -> None:
+    """Raise 403 unless the request originates from loopback.
+
+    Two checks:
+    1. TCP peer address must be a loopback host.
+    2. If an Origin header is present it must be a loopback origin —
+       this blocks CSRF from malicious web pages that can POST to localhost.
+    """
+    if not _is_loopback_client(request):
+        raise HTTPException(status_code=403, detail="Credential updates are allowed only from localhost")
+
+    origin = request.headers.get("origin")
+    if origin is not None and origin.rstrip("/") not in _LOOPBACK_ORIGINS:
+        raise HTTPException(status_code=403, detail="Cross-origin credential updates are not allowed")
 
 
 def _upsert_env_value_preserving_lines(lines: list[str], key: str, value: str) -> list[str]:
@@ -822,22 +846,48 @@ def _write_text_atomic(path: str, lines: list[str]) -> None:
 @app.post("/api/settings")
 async def update_settings(payload: dict, request: Request):
     """Update runtime settings and persist to .env file."""
-    import os
+
+    credential_write_requested = payload.get("key_id") is not None or bool(payload.get("private_key_pem"))
+    if credential_write_requested:
+        _require_loopback_mutation(request)
 
     env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
     env_path = os.path.abspath(env_path)
 
-    credential_write_requested = payload.get("key_id") is not None or bool(payload.get("private_key_pem"))
-    if credential_write_requested and not _is_loopback_client(request):
-        raise HTTPException(status_code=403, detail="Credential updates are allowed only from localhost")
+    # --- Phase 1: validate all numeric fields BEFORE touching any file or state ---
+    validated: dict = {}
 
-    # Load existing .env lines (preserve comments, ordering, and untouched content)
+    if "initial_bankroll" in payload:
+        try:
+            validated["initial_bankroll"] = float(payload["initial_bankroll"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="initial_bankroll must be a number")
+
+    if "min_edge" in payload:
+        try:
+            val = float(payload["min_edge"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="min_edge must be a number")
+        if val <= 0:
+            raise HTTPException(status_code=422, detail="WEATHER_MIN_EDGE_THRESHOLD must be > 0")
+        validated["min_edge"] = val
+
+    if "max_trade_size" in payload:
+        try:
+            val = float(payload["max_trade_size"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="max_trade_size must be a number")
+        if val <= 0:
+            raise HTTPException(status_code=422, detail="WEATHER_MAX_TRADE_SIZE must be > 0")
+        validated["max_trade_size"] = val
+
+    # --- Phase 2: load existing .env (preserve comments, ordering, untouched keys) ---
     env_lines: list[str] = []
     if os.path.exists(env_path):
         with open(env_path, "r") as f:
             env_lines = f.readlines()
 
-    # Handle private key PEM
+    # --- Phase 3: apply all changes atomically ---
     key_id = payload.get("key_id")
     private_key_pem = payload.get("private_key_pem")
 
@@ -864,37 +914,26 @@ async def update_settings(payload: dict, request: Request):
         os.environ["SIMULATION_MODE"] = str(val)
         env_lines = _upsert_env_value_preserving_lines(env_lines, "SIMULATION_MODE", str(val))
 
-    if "initial_bankroll" in payload:
-        try:
-            val = float(payload["initial_bankroll"])
-            object.__setattr__(settings, "INITIAL_BANKROLL", val)
-            os.environ["INITIAL_BANKROLL"] = str(val)
-            env_lines = _upsert_env_value_preserving_lines(env_lines, "INITIAL_BANKROLL", str(val))
-        except (ValueError, TypeError):
-            pass
+    if "initial_bankroll" in validated:
+        val = validated["initial_bankroll"]
+        object.__setattr__(settings, "INITIAL_BANKROLL", val)
+        os.environ["INITIAL_BANKROLL"] = str(val)
+        env_lines = _upsert_env_value_preserving_lines(env_lines, "INITIAL_BANKROLL", str(val))
 
-    if "min_edge" in payload:
-        try:
-            val = float(payload["min_edge"])
-            object.__setattr__(settings, "WEATHER_MIN_EDGE_THRESHOLD", val)
-            os.environ["WEATHER_MIN_EDGE_THRESHOLD"] = str(val)
-            env_lines = _upsert_env_value_preserving_lines(env_lines, "WEATHER_MIN_EDGE_THRESHOLD", str(val))
-        except (ValueError, TypeError):
-            pass
+    if "min_edge" in validated:
+        val = validated["min_edge"]
+        object.__setattr__(settings, "WEATHER_MIN_EDGE_THRESHOLD", val)
+        os.environ["WEATHER_MIN_EDGE_THRESHOLD"] = str(val)
+        env_lines = _upsert_env_value_preserving_lines(env_lines, "WEATHER_MIN_EDGE_THRESHOLD", str(val))
 
-    if "max_trade_size" in payload:
-        try:
-            val = float(payload["max_trade_size"])
-            object.__setattr__(settings, "WEATHER_MAX_TRADE_SIZE", val)
-            os.environ["WEATHER_MAX_TRADE_SIZE"] = str(val)
-            env_lines = _upsert_env_value_preserving_lines(env_lines, "WEATHER_MAX_TRADE_SIZE", str(val))
-        except (ValueError, TypeError):
-            pass
+    if "max_trade_size" in validated:
+        val = validated["max_trade_size"]
+        object.__setattr__(settings, "WEATHER_MAX_TRADE_SIZE", val)
+        os.environ["WEATHER_MAX_TRADE_SIZE"] = str(val)
+        env_lines = _upsert_env_value_preserving_lines(env_lines, "WEATHER_MAX_TRADE_SIZE", str(val))
 
-    # Write .env file
     _write_text_atomic(env_path, env_lines)
 
-    # Reset cached private key in KalshiClient instances (they lazy-load)
     from backend.data.kalshi_client import kalshi_credentials_present
     return {
         "ok": True,

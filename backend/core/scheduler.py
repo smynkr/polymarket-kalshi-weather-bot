@@ -230,8 +230,13 @@ async def weather_scan_and_trade_job():
                 # Silently skip — allocation limit enforced without log noise
                 return
 
+            # INV-414: track running total inside loop to prevent overshoot
+            running_weather_exposure = weather_pending
             trades_executed = 0
             for signal in actionable[:MAX_TRADES_PER_SCAN]:
+                if running_weather_exposure >= MAX_WEATHER_ALLOCATION:
+                    break
+
                 # Check if we already have a trade for this market
                 existing = db.query(Trade).filter(
                     Trade.market_ticker == signal.market.market_id,
@@ -268,6 +273,7 @@ async def weather_scan_and_trade_job():
 
                 db.add(trade)
                 db.flush()
+                running_weather_exposure += trade_size
 
                 # Link to signal record
                 matching_signal = db.query(Signal).filter(
