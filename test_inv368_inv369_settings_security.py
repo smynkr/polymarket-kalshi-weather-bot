@@ -46,6 +46,7 @@ def test_inv369_remote_client_cannot_write_kalshi_credentials(monkeypatch, tmp_p
 
     previous_key_id = main.settings.KALSHI_API_KEY_ID
     previous_key_path = main.settings.KALSHI_PRIVATE_KEY_PATH
+    assert not (tmp_path / "kalshi_private_key.pem").exists(), "pem must not exist before POST"
     client = TestClient(app, client=("203.0.113.10", 4321))
 
     response = client.post(
