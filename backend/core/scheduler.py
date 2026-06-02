@@ -115,6 +115,10 @@ async def scan_and_trade_job():
                 if existing:
                     continue
 
+                if signal.suggested_size <= 0:
+                    log_event("data", f"Skipping zero-size BTC signal: {signal.market.slug}")
+                    continue
+
                 trade_size = min(signal.suggested_size, state.bankroll * MAX_TRADE_FRACTION)
                 trade_size = max(trade_size, MIN_TRADE_SIZE)
 
@@ -244,6 +248,10 @@ async def weather_scan_and_trade_job():
                 ).first()
 
                 if existing:
+                    continue
+
+                if signal.suggested_size <= 0:
+                    log_event("data", f"Skipping zero-size weather signal: {signal.market.slug}")
                     continue
 
                 trade_size = min(signal.suggested_size, settings.WEATHER_MAX_TRADE_SIZE)
