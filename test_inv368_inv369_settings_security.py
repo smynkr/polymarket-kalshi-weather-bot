@@ -53,7 +53,7 @@ def test_inv369_remote_client_cannot_write_kalshi_credentials(monkeypatch, tmp_p
         "/api/settings",
         json={
             "key_id": "remote-key-id",
-            "private_key_pem": "-----BEGIN PRIVATE KEY-----\\nREMOTE\\n-----END PRIVATE KEY-----",
+            "private_key_pem": "[REDACTED PRIVATE KEY]",
         },
     )
 
@@ -62,6 +62,44 @@ def test_inv369_remote_client_cannot_write_kalshi_credentials(monkeypatch, tmp_p
     assert not (tmp_path / "kalshi_private_key.pem").exists()
     assert main.settings.KALSHI_API_KEY_ID == previous_key_id
     assert main.settings.KALSHI_PRIVATE_KEY_PATH == previous_key_path
+
+
+def test_inv369_remote_client_cannot_write_noncredential_settings(monkeypatch, tmp_path):
+    env_path = _point_settings_endpoint_at_tmp_env(monkeypatch, tmp_path)
+    _assert_settings_paths_are_tmp(env_path, tmp_path)
+    env_path.write_text("UNCHANGED=value\n")
+    previous_sim = main.settings.SIMULATION_MODE
+    client = TestClient(app, client=("203.0.113.10", 4321))
+
+    response = client.post("/api/settings", json={"simulation_mode": not previous_sim})
+
+    assert response.status_code == 403
+    assert env_path.read_text() == "UNCHANGED=value\n"
+    assert main.settings.SIMULATION_MODE == previous_sim
+
+
+def test_inv369_null_origin_is_rejected_for_settings_mutations(monkeypatch, tmp_path):
+    env_path = _point_settings_endpoint_at_tmp_env(monkeypatch, tmp_path)
+    _assert_settings_paths_are_tmp(env_path, tmp_path)
+    env_path.write_text("UNCHANGED=value\n")
+    client = TestClient(app, client=("127.0.0.1", 4321))
+
+    response = client.post("/api/settings", headers={"Origin": "null"}, json={"simulation_mode": False})
+
+    assert response.status_code == 403
+    assert env_path.read_text() == "UNCHANGED=value\n"
+
+
+def test_inv369_loopback_origin_with_port_can_update_settings(monkeypatch, tmp_path):
+    env_path = _point_settings_endpoint_at_tmp_env(monkeypatch, tmp_path)
+    _assert_settings_paths_are_tmp(env_path, tmp_path)
+    env_path.write_text("UNCHANGED=value\n")
+    client = TestClient(app, client=("127.0.0.1", 4321))
+
+    response = client.post("/api/settings", headers={"Origin": "http://localhost:5173"}, json={"simulation_mode": True})
+
+    assert response.status_code == 200
+    assert "SIMULATION_MODE=True" in env_path.read_text()
 
 
 def test_inv369_local_credential_write_preserves_env_content_uses_0600_and_redacts_response(monkeypatch, tmp_path):

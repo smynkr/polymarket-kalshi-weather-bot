@@ -35,7 +35,7 @@ from typing import Optional
 CONVERGENCE_THRESHOLD_F = 1.0   # °F — shift below this = forecast has stabilized
 WINDOW_24H_SECONDS = 86400      # 24h in seconds
 WINDOW_TOLERANCE_SECONDS = 7200 # ±2h tolerance when hunting for the 24h-ago entry
-MAX_HISTORY_ENTRIES = 20        # cap per (city, date) key to avoid unbounded growth
+MAX_HISTORY_ENTRIES = 400       # enough 5-min changed runs to preserve 24h±2h history
 
 _HISTORY_PATH = os.path.abspath(
     os.environ.get(

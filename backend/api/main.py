@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import tempfile
+from urllib.parse import urlparse
 
 from backend.config import settings
 from backend.models.database import (
@@ -782,11 +783,14 @@ async def get_settings():
 
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
-_LOOPBACK_ORIGINS = {
-    "http://localhost", "https://localhost",
-    "http://127.0.0.1", "https://127.0.0.1",
-    "null",
-}
+
+
+def _is_loopback_origin(origin: str) -> bool:
+    try:
+        parsed = urlparse(origin)
+    except Exception:
+        return False
+    return parsed.scheme in {"http", "https"} and parsed.hostname in _LOOPBACK_HOSTS
 
 
 def _is_loopback_client(request: Request) -> bool:
@@ -807,8 +811,8 @@ def _require_loopback_mutation(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Credential updates are allowed only from localhost")
 
     origin = request.headers.get("origin")
-    if origin is not None and origin.rstrip("/") not in _LOOPBACK_ORIGINS:
-        raise HTTPException(status_code=403, detail="Cross-origin credential updates are not allowed")
+    if origin is not None and not _is_loopback_origin(origin):
+        raise HTTPException(status_code=403, detail="Cross-origin settings updates are not allowed")
 
 
 def _upsert_env_value_preserving_lines(lines: list[str], key: str, value: str) -> list[str]:
@@ -847,9 +851,7 @@ def _write_text_atomic(path: str, lines: list[str]) -> None:
 async def update_settings(payload: dict, request: Request):
     """Update runtime settings and persist to .env file."""
 
-    credential_write_requested = payload.get("key_id") is not None or bool(payload.get("private_key_pem"))
-    if credential_write_requested:
-        _require_loopback_mutation(request)
+    _require_loopback_mutation(request)
 
     env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
     env_path = os.path.abspath(env_path)

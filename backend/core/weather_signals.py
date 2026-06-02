@@ -354,15 +354,11 @@ def get_metar_temps(city: str, today: date) -> Optional[dict]:
 def metar_high_probability(max_observed_temp_f: float, current_temp_f: float,
                             threshold_f: float, local_hour: int) -> tuple:
     """
-    For KXHIGHT markets: "Will the max temp be <threshold_f?"
-    YES = temp stays below threshold. Returns P(YES), confidence, note.
-
-    If max already EXCEEDED threshold → YES is impossible → P(YES) ≈ 0.01
-    If max is locked BELOW threshold late in day → YES is certain → P(YES) ≈ 0.99
+    For KXHIGHT markets: "Will the max temp be threshold_f or higher?"
+    YES = max temperature reaches/exceeds threshold. Returns P(YES), confidence, note.
     """
     if max_observed_temp_f >= threshold_f:
-        # Threshold already exceeded — YES (below threshold) is impossible
-        return 0.01, "high", f"Max already {max_observed_temp_f}°F >= {threshold_f}°F — YES (below) locked out"
+        return 0.99, "high", f"Max already {max_observed_temp_f}°F >= {threshold_f}°F — YES (at/above) locked in"
 
     if local_hour >= 17:
         headroom = 2
@@ -376,11 +372,9 @@ def metar_high_probability(max_observed_temp_f: float, current_temp_f: float,
     if headroom is not None:
         likely_max = current_temp_f + headroom
         if likely_max < threshold_f - 2:
-            # Very unlikely to reach threshold — YES (stays below) nearly certain
-            return 0.95, "high", f"Current {current_temp_f}°F + {headroom}°F buffer = {likely_max:.1f}°F < {threshold_f}°F — stays below"
+            return 0.05, "high", f"Current {current_temp_f}°F + {headroom}°F buffer = {likely_max:.1f}°F < {threshold_f}°F — YES unlikely"
         elif likely_max >= threshold_f:
-            # Likely to exceed threshold — YES (stays below) unlikely
-            return 0.10, "medium", f"Current {current_temp_f}°F + {headroom}°F buffer = {likely_max:.1f}°F may hit {threshold_f}°F"
+            return 0.90, "medium", f"Current {current_temp_f}°F + {headroom}°F buffer = {likely_max:.1f}°F may hit {threshold_f}°F"
 
     return None, "low", "Too early for METAR lock"
 
@@ -916,19 +910,6 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
             metric = mtype
             mkt_direction = "above"
 
-        filter_status = "ACTIONABLE" if abs(net_edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD else "FILTERED"
-        threshold_str = f"{threshold_f:.0f}°F" if threshold_f else f"{item['market_info'].get('threshold_mm',0):.1f}mm"
-        reasoning = (
-            f"[{filter_status}] {city_name} {metric} {threshold_str} on {target_date} ({item['days_out']}d) | "
-            f"GFS: {p_gfs:.0%} → Final: {p_final:.0%} [{signal_source}] vs Kalshi: {kalshi_prob:.0%} | "
-            f"Edge: {edge:+.1%} Net: {net_edge:+.1%} → {direction.upper()} | "
-            f"Ensemble: {ensemble_mean:.1f} ±{ensemble_std:.1f} ({n_members} members)"
-        )
-        if metar_note:
-            reasoning += f" | METAR: {metar_note}"
-        if convergence_note:
-            reasoning += f" | Convergence: {convergence_note} (size x{convergence_multiplier:.2f})"
-
         market_obj = KalshiWeatherMarket(
             market_id=ticker,
             slug=ticker,
@@ -950,6 +931,24 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
         sources = [signal_source, "open_meteo_gfs"]
         if convergence_note:
             sources.append("forecast_convergence")
+
+        actionable_display = (
+            signal_source != "METAR-early"
+            and net_edge >= settings.WEATHER_MIN_EDGE_THRESHOLD
+            and entry_price <= settings.WEATHER_MAX_ENTRY_PRICE
+        )
+        filter_status = "ACTIONABLE" if actionable_display else "FILTERED"
+        threshold_str = f"{threshold_f:.0f}°F" if threshold_f else f"{item['market_info'].get('threshold_mm',0):.1f}mm"
+        reasoning = (
+            f"[{filter_status}] {city_name} {metric} {threshold_str} on {target_date} ({item['days_out']}d) | "
+            f"GFS: {p_gfs:.0%} → Final: {p_final:.0%} [{signal_source}] vs Kalshi: {kalshi_prob:.0%} | "
+            f"Edge: {edge:+.1%} Net: {net_edge:+.1%} → {direction.upper()} | "
+            f"Ensemble: {ensemble_mean:.1f} ±{ensemble_std:.1f} ({n_members} members)"
+        )
+        if metar_note:
+            reasoning += f" | METAR: {metar_note}"
+        if convergence_note:
+            reasoning += f" | Convergence: {convergence_note} (size x{convergence_multiplier:.2f})"
 
         signal = WeatherTradingSignal(
             market=market_obj,
