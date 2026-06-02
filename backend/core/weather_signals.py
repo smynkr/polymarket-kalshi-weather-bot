@@ -24,6 +24,11 @@ from zoneinfo import ZoneInfo
 
 from backend.config import settings
 from backend.models.database import SessionLocal, Signal
+from backend.core.forecast_convergence import (
+    compute_convergence_score,
+    load_forecast_series,
+    record_forecast_run,
+)
 
 logger = logging.getLogger("trading_bot")
 
@@ -846,6 +851,27 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
         else:
             suggested_size = min(settings.WEATHER_MAX_TRADE_SIZE * 0.5, bankroll * 0.005)
 
+        convergence_note = ""
+        convergence_multiplier = 1.0
+        apply_forecast_convergence = mtype == "temperature_high" and signal_source != "METAR-early"
+        if apply_forecast_convergence:
+            try:
+                target_date_str = target_date.isoformat()
+                record_forecast_run(city, target_date_str, ensemble_mean)
+                convergence = compute_convergence_score(load_forecast_series(city, target_date_str))
+                convergence_multiplier = float(convergence.get("confidence_multiplier", 1.0) or 1.0)
+                convergence_multiplier = max(0.0, min(1.0, convergence_multiplier))
+                suggested_size *= convergence_multiplier
+                convergence_note = str(convergence.get("note") or "")
+            except Exception as e:
+                # Forecast convergence currently models 24h high-temperature
+                # forecast drift in °F. Keep high-temp signals visible if history
+                # persistence fails, but do not fail open to full size.
+                convergence_multiplier = 0.75
+                suggested_size *= convergence_multiplier
+                logger.warning("Forecast convergence unavailable for %s %s: %s", city, target_date, e)
+                convergence_note = f"unavailable ({type(e).__name__}: {e})"
+
         # Kelly fraction estimate
         kelly_fraction = 0.0 if signal_source == "METAR-early" else min(0.1, abs(net_edge) * 0.5)
 
@@ -900,6 +926,8 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
         )
         if metar_note:
             reasoning += f" | METAR: {metar_note}"
+        if convergence_note:
+            reasoning += f" | Convergence: {convergence_note} (size x{convergence_multiplier:.2f})"
 
         market_obj = KalshiWeatherMarket(
             market_id=ticker,
@@ -919,6 +947,10 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
             volume=float(m_raw.get("open_interest_fp", 0) or 0),
         )
 
+        sources = [signal_source, "open_meteo_gfs"]
+        if convergence_note:
+            sources.append("forecast_convergence")
+
         signal = WeatherTradingSignal(
             market=market_obj,
             model_probability=round(p_final, 4),
@@ -929,7 +961,7 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
             confidence=round(confidence, 3),
             kelly_fraction=round(kelly_fraction, 4),
             suggested_size=round(suggested_size, 2),
-            sources=[signal_source, "open_meteo_gfs"],
+            sources=sources,
             reasoning=reasoning,
             ensemble_mean=round(ensemble_mean, 2),
             ensemble_std=round(ensemble_std, 2),
