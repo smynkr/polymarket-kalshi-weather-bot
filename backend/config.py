@@ -1,7 +1,11 @@
 """Configuration settings for the Weather Edge signal dashboard."""
 import os
 from typing import Optional
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional in lightweight test/runtime environments
+    def load_dotenv(*_args, **_kwargs) -> bool:
+        return False
 
 load_dotenv()
 

@@ -162,8 +162,30 @@ def _quarantine_corrupt_history(path: str) -> None:
         logger.warning("Failed to quarantine corrupt forecast history %s: %s", path, exc)
 
 
+def _history_key(city: str, target_date_str: str) -> str:
+    return f"{str(city).strip().lower()}:{target_date_str}"
+
+
+def _sanitize_runs(raw_runs: object) -> list[list[float]]:
+    if not isinstance(raw_runs, list):
+        return []
+    cleaned: list[list[float]] = []
+    for raw in raw_runs:
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            continue
+        try:
+            ts = float(raw[0])
+            value = float(raw[1])
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0:
+            continue
+        cleaned.append([ts, value])
+    return cleaned[-MAX_HISTORY_ENTRIES:]
+
+
 def _load_history() -> dict:
-    """Load forecast run history from disk."""
+    """Load forecast run history from disk, ignoring malformed per-key rows."""
     if not os.path.exists(_HISTORY_PATH):
         return {}
     try:
@@ -175,7 +197,12 @@ def _load_history() -> dict:
     if not isinstance(data, dict):
         logger.warning("Forecast history root is %s, expected dict; ignoring", type(data).__name__)
         return {}
-    return data
+    cleaned: dict[str, list[list[float]]] = {}
+    for key, raw_runs in data.items():
+        runs = _sanitize_runs(raw_runs)
+        if runs:
+            cleaned[str(key)] = runs
+    return cleaned
 
 
 def _save_history(history: dict) -> None:
@@ -216,7 +243,7 @@ def record_forecast_run(city: str, target_date_str: str, forecast_high_f: float)
         target_date_str: ISO date string "YYYY-MM-DD"
         forecast_high_f: predicted high temperature in °F for that target date
     """
-    key = f"{city}:{target_date_str}"
+    key = _history_key(city, target_date_str)
     now_ts = time.time()
 
     with _HISTORY_LOCK:
@@ -244,7 +271,7 @@ def load_forecast_series(city: str, target_date_str: str) -> list[tuple[datetime
     Load the stored forecast series for a (city, target_date) as
     [(datetime, value_f), ...] sorted oldest first.
     """
-    key = f"{city}:{target_date_str}"
+    key = _history_key(city, target_date_str)
     with _HISTORY_LOCK:
         history = _load_history()
     runs = history.get(key, [])

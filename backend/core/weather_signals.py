@@ -853,7 +853,7 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
 
         convergence_note = ""
         convergence_multiplier = 1.0
-        apply_forecast_convergence = mtype == "temperature_high" and signal_source != "METAR-early"
+        apply_forecast_convergence = mtype == "temperature_high" and signal_source not in ("METAR-early", "METAR-lock")
         if apply_forecast_convergence:
             try:
                 target_date_str = target_date.isoformat()

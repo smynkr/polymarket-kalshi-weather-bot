@@ -54,6 +54,22 @@ def test_forecast_history_quarantines_corrupt_json_and_recovers(tmp_path, monkey
     assert series[0][1] == 74.2
 
 
+def test_forecast_history_ignores_malformed_per_key_rows_and_normalizes_city(tmp_path, monkeypatch):
+    history_path = tmp_path / "forecast_run_history.json"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    history_path.write_text(
+        '{"NYC:2026-05-24": "bad", "nyc:2026-05-24": [[%s, 74.2], ["bad", 75], [123]], "other": {}}'
+        % now_ts,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(fc, "_HISTORY_PATH", str(history_path))
+
+    series = fc.load_forecast_series(" NYC ", "2026-05-24")
+
+    assert len(series) == 1
+    assert series[0][1] == 74.2
+
+
 def test_weather_signal_size_is_scaled_by_forecast_convergence(monkeypatch):
     target = date.today()
     market = {
@@ -249,5 +265,56 @@ def test_forecast_convergence_does_not_scale_rain_markets(monkeypatch):
     signals = ws._build_signals_sync()
 
     assert len(signals) == 1
+    assert signals[0].suggested_size == 100.0
+    assert "forecast_convergence" not in signals[0].sources
+
+
+def test_metar_lock_temperature_signal_bypasses_forecast_convergence(monkeypatch):
+    target = date.today()
+    market = {
+        "ticker": "KXHIGHNY-26MAY24-T70",
+        "title": "New York high temperature above 70°F",
+        "rules_primary": f"on {target.isoformat()} high above 70 F",
+        "yes_bid_dollars": 0.39,
+        "yes_ask_dollars": 0.41,
+        "last_price_dollars": 0.40,
+        "open_interest_fp": 1000,
+    }
+    monkeypatch.setattr(ws, "fetch_kalshi_weather_markets", lambda: [market])
+    monkeypatch.setattr(ws, "parse_market_date", lambda m: target)
+    monkeypatch.setattr(
+        ws,
+        "parse_market_type",
+        lambda m: {
+            "type": "temperature_high",
+            "city": "nyc",
+            "threshold_f": 70.0,
+            "threshold_c": 21.1,
+            "threshold_mm": 0.0,
+        },
+    )
+    monkeypatch.setattr(ws, "fetch_ensemble", lambda lat, lon, target_date: {"ok": True})
+    monkeypatch.setattr(
+        ws,
+        "compute_probability",
+        lambda ensemble, target_date, market_info: {"prob": 0.65, "mean": 74.2, "std": 1.0, "n": 31},
+    )
+    monkeypatch.setattr(ws, "get_metar_temps", lambda city, today: {"max_temp_f": 75.0, "current_temp_f": 75.0, "local_hour": 16})
+    monkeypatch.setattr(ws.settings, "INITIAL_BANKROLL", 10_000.0)
+    monkeypatch.setattr(ws.settings, "WEATHER_MAX_TRADE_SIZE", 100.0)
+    monkeypatch.setattr(ws.settings, "WEATHER_MIN_EDGE_THRESHOLD", 0.01)
+    monkeypatch.setattr(ws.settings, "WEATHER_MAX_ENTRY_PRICE", 0.99)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("METAR-lock is already physical truth and must not use forecast convergence")
+
+    monkeypatch.setattr(ws, "record_forecast_run", fail_if_called, raising=False)
+    monkeypatch.setattr(ws, "load_forecast_series", fail_if_called, raising=False)
+    monkeypatch.setattr(ws, "compute_convergence_score", fail_if_called, raising=False)
+
+    signals = ws._build_signals_sync()
+
+    assert len(signals) == 1
+    assert signals[0].signal_source == "METAR-lock"
     assert signals[0].suggested_size == 100.0
     assert "forecast_convergence" not in signals[0].sources
