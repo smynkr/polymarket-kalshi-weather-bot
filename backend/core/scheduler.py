@@ -254,7 +254,13 @@ async def weather_scan_and_trade_job():
                     log_event("data", f"Skipping zero-size weather signal: {signal.market.slug}")
                     continue
 
-                trade_size = min(signal.suggested_size, settings.WEATHER_MAX_TRADE_SIZE)
+                remaining_capacity = MAX_WEATHER_ALLOCATION - running_weather_exposure
+                if remaining_capacity < MIN_TRADE_SIZE:
+                    break
+
+                trade_size = min(signal.suggested_size, settings.WEATHER_MAX_TRADE_SIZE, remaining_capacity)
+                if trade_size < MIN_TRADE_SIZE:
+                    continue
                 trade_size = max(trade_size, MIN_TRADE_SIZE)
 
                 if state.bankroll < MIN_TRADE_SIZE:
