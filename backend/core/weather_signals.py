@@ -361,8 +361,8 @@ class WeatherTradingSignal:
         if self.signal_source == "METAR-early":
             return "metar_early_watch_only"
 
-        is_same_day_temperature = self.market.target_date == date.today() and self.market.metric in {"high", "low"}
-        if is_same_day_temperature:
+        is_same_day_authority_market = self.market.target_date == date.today() and self.market.metric == "high"
+        if is_same_day_authority_market:
             if self.weather_observation is None:
                 return "weather_observation_missing"
             if not self.weather_observation.is_fresh(max_age_seconds=300):

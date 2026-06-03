@@ -4,7 +4,7 @@ from backend.core.weather_source_benchmark import SourceObservation
 from backend.core.weather_signals import KalshiWeatherMarket, WeatherObservation, WeatherTradingSignal
 
 
-def _market(*, target_date=None):
+def _market(*, target_date=None, metric="high"):
     return KalshiWeatherMarket(
         market_id="KXHIGHTNY-26JUN03-T85",
         slug="KXHIGHTNY-26JUN03-T85",
@@ -12,7 +12,7 @@ def _market(*, target_date=None):
         city_name="New York City",
         target_date=target_date or date.today(),
         threshold_f=85.0,
-        metric="high",
+        metric=metric,
         yes_price=0.4,
         no_price=0.6,
     )
@@ -112,6 +112,20 @@ def test_fresh_authority_lock_can_pass_threshold():
         weather_observation=_authority_observation(temp_f=86.0),
         source_observations=[_source_observation("aviationweather_metar", 86.0)],
         source_fusion_policy={"aviationweather_metar": {"role": "lock_authority"}},
+    )
+
+    assert signal.trade_skip_reason() is None
+    assert signal.passes_threshold is True
+
+
+def test_same_day_low_temperature_signal_does_not_require_high_temp_authority_lock():
+    signal = WeatherTradingSignal(
+        market=_market(metric="low"),
+        model_probability=0.95,
+        market_probability=0.40,
+        edge=0.55,
+        net_edge=0.48,
+        suggested_size=50.0,
     )
 
     assert signal.trade_skip_reason() is None
