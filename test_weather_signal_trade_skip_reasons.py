@@ -46,7 +46,7 @@ def _source_observation(source, temp_f):
     )
 
 
-def test_same_day_temperature_signal_fails_closed_without_observation():
+def test_same_day_temperature_high_signal_fails_closed_without_observation():
     signal = WeatherTradingSignal(
         market=_market(),
         model_probability=0.95,
@@ -58,6 +58,21 @@ def test_same_day_temperature_signal_fails_closed_without_observation():
 
     assert signal.trade_skip_reason() == "weather_observation_missing"
     assert signal.passes_threshold is False
+
+
+def test_same_day_temperature_low_signal_without_observation_keeps_forecast_path_eligible():
+    signal = WeatherTradingSignal(
+        market=_market(),
+        model_probability=0.95,
+        market_probability=0.40,
+        edge=0.55,
+        net_edge=0.48,
+        suggested_size=50.0,
+    )
+    signal.market.metric = "low"
+
+    assert signal.trade_skip_reason() is None
+    assert signal.passes_threshold is True
 
 
 def test_stale_weather_observation_blocks_otherwise_actionable_signal_with_exact_reason():

@@ -43,9 +43,12 @@ def _install_fake_apscheduler(monkeypatch):
     monkeypatch.setitem(sys.modules, "apscheduler.triggers.interval", triggers_interval)
 
 
-def _signal(state="near"):
+def _signal(state="near", *, naive_observation=False):
     observed = datetime(2026, 6, 3, 15, 51, tzinfo=timezone.utc)
     fetched = datetime(2026, 6, 3, 15, 52, tzinfo=timezone.utc)
+    if naive_observation:
+        observed = observed.replace(tzinfo=None)
+        fetched = fetched.replace(tzinfo=None)
     return ws.WeatherTradingSignal(
         market=ws.KalshiWeatherMarket(
             market_id="KXHIGHTNY-26JUN03-T85",
@@ -100,3 +103,19 @@ def test_weather_status_endpoint_exposes_last_change_observation_age_and_next_fa
     assert body["last_observation"]["station_id"] == "KJFK"
     assert body["last_change"]["market_id"] == "KXHIGHTNY-26JUN03-T85"
     assert body["last_change"]["state"] == "near"
+
+
+def test_weather_status_endpoint_tolerates_legacy_naive_observation_datetimes(monkeypatch):
+    monkeypatch.setattr(api_main.settings, "WEATHER_ENABLED", True)
+    monkeypatch.setattr(api_main.settings, "WEATHER_NOWCAST_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr("backend.core.weather_signals.get_cached_signals", lambda: [_signal("near", naive_observation=True)])
+    monkeypatch.setattr("backend.core.weather_signals.get_signal_cache_age_seconds", lambda: 12.0)
+    monkeypatch.setattr("backend.core.scheduler.get_recent_events", lambda _limit: [])
+    monkeypatch.setattr("backend.api.main.datetime", type("FakeDateTime", (), {
+        "utcnow": staticmethod(lambda: datetime(2026, 6, 3, 15, 52, 30, tzinfo=timezone.utc)),
+    }))
+
+    response = TestClient(app).get("/api/weather/status")
+
+    assert response.status_code == 200
+    assert response.json()["last_observation_age_seconds"] == 90.0
