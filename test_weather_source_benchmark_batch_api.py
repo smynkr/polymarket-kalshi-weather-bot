@@ -60,3 +60,19 @@ def test_source_benchmark_batch_endpoint_persists_multiple_station_results(tmp_p
     from backend.core.weather_source_benchmark import load_source_benchmark_history
     records = load_source_benchmark_history(history_path)
     assert sum(1 for record in records if record["source"] == "nws_latest_observation") == 2
+
+
+def test_source_benchmark_batch_endpoint_rejects_unbounded_target_lists(monkeypatch):
+    monkeypatch.setattr(api_main.settings, "WEATHER_SOURCE_BENCHMARK_HISTORY_PATH", "unused.jsonl", raising=False)
+    response = TestClient(app).post(
+        "/api/weather/source-benchmark/batch",
+        json={
+            "targets": [
+                {"station_id": f"K{i:03d}", "lat": 40.0, "lon": -73.0}
+                for i in range(api_main.MAX_WEATHER_SOURCE_BENCHMARK_BATCH_TARGETS + 1)
+            ]
+        },
+    )
+
+    assert response.status_code == 422
+    assert "targets must contain 1-10 stations" in response.json()["detail"]
