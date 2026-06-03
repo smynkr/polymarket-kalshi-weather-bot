@@ -121,8 +121,44 @@ export interface WeatherSignal {
   ensemble_mean: number
   ensemble_std: number
   ensemble_members: number
+  signal_source?: string
+  metar_note?: string
+  observation_source?: string
+  station_id?: string
+  observed_at?: string
+  fetched_at?: string
+  signal_at?: string
+  observation_latency_seconds?: number
+  signal_latency_seconds?: number
+  threshold_state?: string
+  fusion_lock_state?: string
+  fusion_trade_allowed?: boolean
+  fusion_authority_source?: string
+  fusion_watch_sources?: string[]
+  fusion_rejected_sources?: string[]
+  fusion_conflicts?: string[]
+  fusion_skip_reason?: string
+  raw_hash?: string
+  source_url?: string
   actionable: boolean
   platform?: string
+}
+
+export interface WeatherStatus {
+  enabled: boolean
+  fast_loop_interval_seconds: number
+  next_fast_scan_in_seconds: number | null
+  cache_age_seconds: number | null
+  last_observation_age_seconds: number | null
+  last_observation?: {
+    source: string
+    station_id: string
+    observed_at: string
+    fetched_at: string
+    temp_f: number
+    raw_hash: string
+  } | null
+  last_change?: Record<string, unknown> | null
 }
 
 export interface KalshiPosition {
@@ -228,6 +264,8 @@ export interface LiveData {
   metar_lines: string[]
   metar_poly_lines: string[]
   metar_v2_signals: MetarV2Signal[]
+  weather_signals: WeatherSignal[]
+  weather_forecasts: WeatherForecast[]
   system: SystemStatus
 }
 

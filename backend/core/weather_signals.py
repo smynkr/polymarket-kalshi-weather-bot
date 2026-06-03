@@ -11,6 +11,8 @@ Uses:
 Supports rain, temperature_high, temperature_low, snow markets for 200+ tickers.
 """
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import pickle
@@ -23,7 +25,7 @@ from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 from backend.config import settings
-from backend.models.database import SessionLocal, Signal
+from backend.models.database import SessionLocal, Signal, WeatherObservationRecord
 from backend.core.forecast_convergence import (
     compute_convergence_score,
     load_forecast_series,
@@ -124,7 +126,7 @@ CITY_COORDS = {
 _ensemble_cache: dict = {}       # key -> (timestamp, data)
 _metar_cache: dict = {}          # key -> (timestamp, data)
 _ENSEMBLE_CACHE_TTL = 10800      # 3 hours — GFS data is stable
-_METAR_CACHE_TTL = 1800          # 30 minutes — METAR is real-time
+_METAR_CACHE_TTL = 60            # 1 minute — METAR freshness drives same-day locks
 
 # Disk cache path — survives restarts
 _DISK_CACHE_PATH = os.path.join(os.path.dirname(__file__), "../../../../.ensemble_cache.pkl")
@@ -199,6 +201,109 @@ def get_signal_cache_age_seconds() -> float:
 
 # ─── DATA CLASSES ───────────────────────────────────────────────────────────────
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_utc_datetime(value) -> Optional[datetime]:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
+
+
+@dataclass
+class WeatherObservation:
+    """Raw weather observation with provenance for freshness-sensitive locks."""
+    source: str
+    station_id: str
+    observed_at: datetime
+    fetched_at: datetime
+    temp_f: float
+    raw: dict
+    raw_hash: str
+    source_url: str
+    qc: Optional[str] = None
+
+    @property
+    def freshness_seconds(self) -> float:
+        return max(0.0, (self.fetched_at - self.observed_at).total_seconds())
+
+    def is_fresh(self, max_age_seconds: int = 300) -> bool:
+        return self.freshness_seconds <= max_age_seconds
+
+
+@dataclass(frozen=True)
+class ImpactedWeatherRecomputePlan:
+    """Event-driven recompute scope for a changed station observation."""
+    station_id: str
+    changed: bool
+    city_keys: list[str]
+    market_ids: list[str]
+    raw_hash: str
+    skip_reason: Optional[str] = None
+
+
+def _city_keys_for_station(station_id: str) -> set[str]:
+    station = station_id.upper()
+    return {city.lower() for city, icao in CITY_AIRPORTS.items() if icao.upper() == station}
+
+
+def plan_impacted_weather_recompute(
+    observation: WeatherObservation,
+    signals: List["WeatherTradingSignal"],
+    *,
+    as_of_date: date,
+    previous_hash_by_station: dict[str, str],
+) -> ImpactedWeatherRecomputePlan:
+    """Scope recompute work to same-day weather tickers affected by a station change."""
+    station = observation.station_id.upper()
+    if previous_hash_by_station.get(station) == observation.raw_hash:
+        return ImpactedWeatherRecomputePlan(
+            station_id=station,
+            changed=False,
+            city_keys=[],
+            market_ids=[],
+            raw_hash=observation.raw_hash,
+            skip_reason="observation_hash_unchanged",
+        )
+
+    station_city_keys = _city_keys_for_station(station)
+    impacted_city_keys: set[str] = set()
+    impacted_market_ids: list[str] = []
+    seen_market_ids: set[str] = set()
+
+    for signal in signals:
+        market = getattr(signal, "market", None)
+        if market is None:
+            continue
+        city_key = str(getattr(market, "city_key", "")).lower()
+        target_date = getattr(market, "target_date", None)
+        market_id = getattr(market, "market_id", None)
+        if city_key not in station_city_keys or target_date != as_of_date or not market_id:
+            continue
+        if market_id in seen_market_ids:
+            continue
+        seen_market_ids.add(market_id)
+        impacted_city_keys.add(city_key)
+        impacted_market_ids.append(market_id)
+
+    return ImpactedWeatherRecomputePlan(
+        station_id=station,
+        changed=True,
+        city_keys=sorted(impacted_city_keys),
+        market_ids=impacted_market_ids,
+        raw_hash=observation.raw_hash,
+        skip_reason=None,
+    )
+
 @dataclass
 class KalshiWeatherMarket:
     """Minimal market descriptor mirroring the WeatherMarket interface."""
@@ -245,9 +350,45 @@ class WeatherTradingSignal:
     gfs_prob: float = 0.0
     signal_source: str = "GFS-ensemble"
     metar_note: str = ""
+    threshold_state: Optional[str] = None
+    weather_observation: Optional[WeatherObservation] = None
+    source_observations: Optional[list] = None
+    source_fusion_policy: Optional[dict] = None
+    signal_at: datetime = field(default_factory=_utcnow)
+
+    def trade_skip_reason(self) -> Optional[str]:
+        """Exact safety reason this weather signal must not trade, if any."""
+        if self.signal_source == "METAR-early":
+            return "metar_early_watch_only"
+
+        is_same_day_temperature = self.market.target_date == date.today() and self.market.metric in {"high", "low"}
+        if is_same_day_temperature:
+            if self.weather_observation is None:
+                return "weather_observation_missing"
+            if not self.weather_observation.is_fresh(max_age_seconds=300):
+                return (
+                    f"{self.weather_observation.source}.stale_observation_age_"
+                    f"{int(self.weather_observation.freshness_seconds)}s_gt_300s"
+                )
+            if self.source_observations and self.source_fusion_policy:
+                from backend.core.weather_source_fusion import fuse_weather_observations
+
+                fused = fuse_weather_observations(
+                    observations=self.source_observations,
+                    policy=self.source_fusion_policy,
+                    threshold_f=self.market.threshold_f,
+                    metric=self.market.metric,
+                )
+                if not fused.trade_allowed:
+                    if fused.conflicts:
+                        return ";".join(fused.conflicts)
+                    return fused.skip_reason or "source_fusion_trade_not_allowed"
+        return None
 
     @property
     def passes_threshold(self) -> bool:
+        if self.trade_skip_reason() is not None:
+            return False
         # INV-411: positive edge only — negative edge signals must not trade
         if self.net_edge < settings.WEATHER_MIN_EDGE_THRESHOLD:
             return False
@@ -268,28 +409,133 @@ def fahrenheit_to_celsius(f: float) -> float:
     return (f - 32) * 5 / 9
 
 
+def load_live_source_fusion_policy() -> dict:
+    """Load conservative source-fusion policy derived from persisted benchmark history."""
+    try:
+        from backend.core.weather_source_benchmark import build_source_promotion_policy, summarize_source_benchmark_history
+        history_path = settings.WEATHER_SOURCE_BENCHMARK_HISTORY_PATH or "data/weather_source_benchmark_history.jsonl"
+        summary = summarize_source_benchmark_history(history_path)
+        policy = build_source_promotion_policy(summary)
+        if policy:
+            return policy
+    except Exception as e:
+        logger.debug("Source fusion policy load failed: %s", e)
+    return {"aviationweather_metar": {"role": "lock_authority", "reason": "default_physical_authority"}}
+
+
+def _source_observation_from_weather_observation(observation: WeatherObservation):
+    from backend.core.weather_source_benchmark import SourceObservation
+    return SourceObservation(
+        source=observation.source,
+        station_id=observation.station_id,
+        observed_at=observation.observed_at,
+        fetched_at=observation.fetched_at,
+        temp_f=observation.temp_f,
+        source_url=observation.source_url,
+        raw_hash=observation.raw_hash,
+        qc=observation.qc,
+    )
+
+
+def collect_source_observations_for_station(
+    station_id: str,
+    *,
+    lat: Optional[float],
+    lon: Optional[float],
+    authority_observation: Optional[WeatherObservation],
+    comparator_providers: Optional[list] = None,
+) -> tuple[list, dict[str, str]]:
+    """Collect authority + comparator observations for source fusion without hiding failures."""
+    from backend.core.weather_source_benchmark import default_benchmark_providers
+
+    observations = []
+    failures: dict[str, str] = {}
+    if authority_observation is not None:
+        observations.append(_source_observation_from_weather_observation(authority_observation))
+
+    providers = comparator_providers
+    if providers is None:
+        # Skip the first default provider because it wraps the same METAR authority
+        # observation already supplied by the signal path.
+        providers = default_benchmark_providers()[1:]
+
+    for provider in providers:
+        name = getattr(provider, "__name__", provider.__class__.__name__)
+        try:
+            observation = provider(station_id.upper(), lat, lon)
+        except Exception as exc:
+            failures[name] = f"{type(exc).__name__}: {exc}"
+            continue
+        if observation is not None:
+            observations.append(observation)
+    return observations, failures
+
+
 # ─── METAR FETCHING ─────────────────────────────────────────────────────────────
 
 def fetch_metar(icao: str) -> Optional[list]:
-    """Fetch last 12 hours of METAR obs for a given airport ICAO."""
-    if icao in _metar_cache:
-        return _metar_cache[icao]
+    """Fetch recent METAR observations for an airport, honoring the METAR TTL."""
+    now = time.time()
+    cached = _metar_cache.get(icao)
+    if cached is not None:
+        cached_ts, cached_data = cached
+        if now - cached_ts < _METAR_CACHE_TTL:
+            return cached_data
     try:
         params = {"ids": icao, "format": "json", "hours": 12}
         resp = requests.get(METAR_BASE, params=params, timeout=10)
         if resp.status_code != 200:
-            _metar_cache[icao] = None
+            _metar_cache[icao] = (now, None)
             return None
         data = resp.json()
         if not data:
-            _metar_cache[icao] = None
+            _metar_cache[icao] = (now, None)
             return None
-        _metar_cache[icao] = data
+        _metar_cache[icao] = (now, data)
         return data
     except Exception as e:
         logger.warning(f"METAR fetch error for {icao}: {e}")
-        _metar_cache[icao] = None
+        _metar_cache[icao] = (now, None)
         return None
+
+
+def _metar_source_url(icao: str) -> str:
+    return f"{METAR_BASE}?ids={icao}&format=json&hours=12"
+
+
+def fetch_latest_metar_observation(icao: str) -> Optional[WeatherObservation]:
+    """Return the newest AviationWeather METAR observation with provenance."""
+    obs_list = fetch_metar(icao)
+    if not obs_list:
+        return None
+
+    newest = None
+    newest_time = None
+    for obs in obs_list:
+        temp_c = obs.get("temp")
+        observed_at = _parse_utc_datetime(obs.get("obsTime"))
+        if temp_c is None or observed_at is None:
+            continue
+        if newest_time is None or observed_at > newest_time:
+            newest = obs
+            newest_time = observed_at
+
+    if newest is None or newest_time is None:
+        return None
+
+    raw_json = json.dumps(newest, sort_keys=True, separators=(",", ":"))
+    fetched_at = _utcnow()
+    return WeatherObservation(
+        source="aviationweather_metar",
+        station_id=str(newest.get("icaoId") or icao).upper(),
+        observed_at=newest_time,
+        fetched_at=fetched_at,
+        temp_f=round(celsius_to_fahrenheit(float(newest["temp"])), 1),
+        raw=newest,
+        raw_hash=hashlib.sha256(raw_json.encode("utf-8")).hexdigest(),
+        source_url=_metar_source_url(icao),
+        qc=newest.get("qcField") or newest.get("qualityControl"),
+    )
 
 
 def get_metar_temps(city: str, today: date) -> Optional[dict]:
@@ -303,6 +549,21 @@ def get_metar_temps(city: str, today: date) -> Optional[dict]:
             break
     if not icao:
         return None
+
+    latest_observation = fetch_latest_metar_observation(icao)
+    if latest_observation and not latest_observation.is_fresh(max_age_seconds=300):
+        return {
+            "icao": icao,
+            "status": "stale",
+            "stale_reason": (
+                f"{latest_observation.source}.stale_observation_age_"
+                f"{int(latest_observation.freshness_seconds)}s_gt_300s"
+            ),
+            "current_temp_f": None,
+            "max_temp_f": None,
+            "local_hour": None,
+            "observation": latest_observation,
+        }
 
     obs_list = fetch_metar(icao)
     if not obs_list:
@@ -345,9 +606,11 @@ def get_metar_temps(city: str, today: date) -> Optional[dict]:
 
     return {
         "icao": icao,
+        "status": "fresh",
         "current_temp_f": round(current_temp_f, 1),
         "max_temp_f": round(max_temp_f, 1),
         "local_hour": local_hour,
+        "observation": latest_observation,
     }
 
 
@@ -404,6 +667,33 @@ def fetch_kalshi_weather_markets() -> list:
 
     logger.info(f"Kalshi: {len(all_markets)} weather markets found")
     return all_markets
+
+
+def fetch_kalshi_weather_markets_for_tickers(tickers: list[str]) -> list:
+    """Fetch only the requested Kalshi weather market tickers.
+
+    Used by the fast nowcast impacted-recompute lane so a single station update
+    does not trigger a full WEATHER_SERIES scan.
+    """
+    markets = []
+    seen = set()
+    for ticker in tickers:
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        try:
+            resp = requests.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=10)
+            if resp.status_code != 200:
+                logger.debug("Kalshi %s: HTTP %s", ticker, resp.status_code)
+                continue
+            payload = resp.json()
+            market = payload.get("market") if isinstance(payload, dict) else None
+            if market:
+                markets.append(market)
+        except Exception as e:
+            logger.debug("Kalshi %s: %s", ticker, e)
+    logger.info("Kalshi: %d scoped weather market(s) refreshed", len(markets))
+    return markets
 
 
 # ─── MARKET PARSING ─────────────────────────────────────────────────────────────
@@ -719,10 +1009,11 @@ def compute_probability(ensemble_data: dict, target_date: date, market_info: dic
 
 # ─── SIGNAL GENERATION (SYNC) ───────────────────────────────────────────────────
 
-def _build_signals_sync() -> List[WeatherTradingSignal]:
+def _build_signals_sync(raw_markets: Optional[list] = None) -> List[WeatherTradingSignal]:
     """
     Core signal generation logic (synchronous).
     Fetches Kalshi markets, GFS ensemble, METAR and builds WeatherTradingSignal list.
+    When raw_markets is provided, recomputes only that scoped market set.
     """
     global _ensemble_cache, _metar_cache
     # Don't clear caches — use TTL expiry instead to avoid hammering open-meteo
@@ -731,7 +1022,7 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
     bankroll = settings.INITIAL_BANKROLL
 
     # Step 1: Fetch markets
-    raw_markets = fetch_kalshi_weather_markets()
+    raw_markets = fetch_kalshi_weather_markets() if raw_markets is None else raw_markets
     if not raw_markets:
         logger.warning("No Kalshi weather markets found")
         return []
@@ -800,6 +1091,7 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
         p_final = p_gfs
         signal_source = "GFS-ensemble"
         metar_note = ""
+        weather_observation = None
 
         is_same_day = (target_date == today)
         threshold_f = item["market_info"].get("threshold_f")
@@ -807,23 +1099,27 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
         if is_same_day and mtype == "temperature_high" and threshold_f is not None:
             metar_data = get_metar_temps(city, today)
             if metar_data:
-                p_metar, confidence, note = metar_high_probability(
-                    metar_data["max_temp_f"],
-                    metar_data["current_temp_f"],
-                    threshold_f,
-                    metar_data["local_hour"],
-                )
-                metar_note = note
-                if p_metar is not None and confidence == "high":
-                    p_final = p_metar
-                    signal_source = "METAR-lock"
-                elif p_metar is not None and confidence == "medium":
-                    # METAR-early = GFS projection, not a physical lock.
-                    # Show as informational context only — do NOT trade on this.
-                    signal_source = "METAR-early"
-                    p_final = p_metar
-                    # Force below edge threshold so it never appears as actionable
-                    # (will still appear in dashboard as a "watch" signal)
+                weather_observation = metar_data.get("observation")
+                if metar_data.get("status") == "stale":
+                    metar_note = metar_data.get("stale_reason", "aviationweather_metar.stale")
+                else:
+                    p_metar, confidence, note = metar_high_probability(
+                        metar_data["max_temp_f"],
+                        metar_data["current_temp_f"],
+                        threshold_f,
+                        metar_data["local_hour"],
+                    )
+                    metar_note = note
+                    if p_metar is not None and confidence == "high":
+                        p_final = p_metar
+                        signal_source = "METAR-lock"
+                    elif p_metar is not None and confidence == "medium":
+                        # METAR-early = GFS projection, not a physical lock.
+                        # Show as informational context only — do NOT trade on this.
+                        signal_source = "METAR-early"
+                        p_final = p_metar
+                        # Force below edge threshold so it never appears as actionable
+                        # (will still appear in dashboard as a "watch" signal)
 
         kalshi_prob = item["kalshi_prob"]
         edge = p_final - kalshi_prob
@@ -950,6 +1246,19 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
         if convergence_note:
             reasoning += f" | Convergence: {convergence_note} (size x{convergence_multiplier:.2f})"
 
+        signal_source_observations = []
+        source_observation_failures = {}
+        if weather_observation is not None:
+            station_id = weather_observation.station_id
+            signal_source_observations, source_observation_failures = collect_source_observations_for_station(
+                station_id,
+                lat=lat,
+                lon=lon,
+                authority_observation=weather_observation,
+            )
+            if source_observation_failures:
+                sources.append("source_observation_failures")
+
         signal = WeatherTradingSignal(
             market=market_obj,
             model_probability=round(p_final, 4),
@@ -968,7 +1277,16 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
             gfs_prob=round(p_gfs, 4),
             signal_source=signal_source,
             metar_note=metar_note,
+            threshold_state=None,
+            weather_observation=weather_observation,
+            source_observations=signal_source_observations,
+            source_fusion_policy=load_live_source_fusion_policy(),
+            signal_at=_utcnow(),
         )
+        trade_skip_reason = signal.trade_skip_reason()
+        if trade_skip_reason:
+            signal.suggested_size = 0.0
+            signal.reasoning += f" | Trade block: {trade_skip_reason}"
         signals.append(signal)
 
     # Sort: best net_edge first
@@ -986,28 +1304,47 @@ def _build_signals_sync() -> List[WeatherTradingSignal]:
     return signals
 
 
-async def scan_for_weather_signals() -> List[WeatherTradingSignal]:
+async def scan_for_weather_signals(raw_markets: Optional[list] = None) -> List[WeatherTradingSignal]:
     """
     Async wrapper for signal generation. Runs sync IO in executor to avoid blocking.
     Populates _last_signal_results cache so dashboard can serve instantly.
+
+    If raw_markets is supplied, only those markets are recomputed and merged into
+    the existing cache; the full Kalshi/GFS scan remains separate.
     """
     global _last_signal_results, _last_signal_timestamp
     import time
     loop = asyncio.get_event_loop()
     try:
-        signals = await loop.run_in_executor(None, _build_signals_sync)
+        signals = await loop.run_in_executor(None, _build_signals_sync, raw_markets)
     except Exception as e:
         logger.error(f"Weather scan failed: {e}")
         signals = []
 
-    _last_signal_results = signals
+    if raw_markets is None:
+        _last_signal_results = signals
+    else:
+        recomputed_ids = {s.market.market_id for s in signals}
+        _last_signal_results = [
+            s for s in _last_signal_results
+            if getattr(getattr(s, "market", None), "market_id", None) not in recomputed_ids
+        ] + signals
     _last_signal_timestamp = time.time()
     _persist_weather_signals(signals)
     return signals
 
 
+async def recompute_weather_signals_for_tickers(tickers: list[str]) -> List[WeatherTradingSignal]:
+    """Refresh Kalshi quotes and recompute only the impacted weather tickers."""
+    if not tickers:
+        return []
+    loop = asyncio.get_event_loop()
+    raw_markets = await loop.run_in_executor(None, fetch_kalshi_weather_markets_for_tickers, tickers)
+    return await scan_for_weather_signals(raw_markets=raw_markets)
+
+
 def _persist_weather_signals(signals: List[WeatherTradingSignal]):
-    """Save weather signals to DB for calibration tracking."""
+    """Save weather signals and raw weather observations to DB for calibration tracking."""
     to_save = [s for s in signals if abs(s.edge) > 0]
     if not to_save:
         return
@@ -1015,6 +1352,34 @@ def _persist_weather_signals(signals: List[WeatherTradingSignal]):
     db = SessionLocal()
     try:
         for signal in to_save:
+            observation = getattr(signal, "weather_observation", None)
+            if observation is not None:
+                existing_observation = db.query(WeatherObservationRecord).filter(
+                    WeatherObservationRecord.source == observation.source,
+                    WeatherObservationRecord.station_id == observation.station_id,
+                    WeatherObservationRecord.raw_hash == observation.raw_hash,
+                ).first()
+                if existing_observation is None:
+                    signal_at = getattr(signal, "signal_at", None)
+                    db.add(WeatherObservationRecord(
+                        source=observation.source,
+                        station_id=observation.station_id,
+                        market_ticker=signal.market.market_id,
+                        observed_at=observation.observed_at,
+                        fetched_at=observation.fetched_at,
+                        signal_at=signal_at,
+                        temp_f=observation.temp_f,
+                        qc=observation.qc,
+                        raw_hash=observation.raw_hash,
+                        source_url=observation.source_url,
+                        raw_payload=observation.raw,
+                        observation_latency_seconds=observation.freshness_seconds,
+                        signal_latency_seconds=(
+                            max(0.0, (signal_at - observation.fetched_at).total_seconds())
+                            if signal_at is not None else None
+                        ),
+                    ))
+
             existing = db.query(Signal).filter(
                 Signal.market_ticker == signal.market.market_id,
                 Signal.timestamp >= signal.timestamp.replace(second=0, microsecond=0),

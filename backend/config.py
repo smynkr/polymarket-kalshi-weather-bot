@@ -63,11 +63,13 @@ class Settings:
         self.BTC_ENABLED = _bool("BTC_ENABLED", False)
         self.WEATHER_ENABLED = _bool("WEATHER_ENABLED", True)
         self.WEATHER_SCAN_INTERVAL_SECONDS = _int("WEATHER_SCAN_INTERVAL_SECONDS", 300)
+        self.WEATHER_NOWCAST_INTERVAL_SECONDS = _int("WEATHER_NOWCAST_INTERVAL_SECONDS", 60)
         self.WEATHER_SETTLEMENT_INTERVAL_SECONDS = _int("WEATHER_SETTLEMENT_INTERVAL_SECONDS", 1800)
         self.WEATHER_MIN_EDGE_THRESHOLD = _float("WEATHER_MIN_EDGE_THRESHOLD", 0.08)
         self.WEATHER_MAX_ENTRY_PRICE = _float("WEATHER_MAX_ENTRY_PRICE", 0.70)
         self.WEATHER_MAX_TRADE_SIZE = _float("WEATHER_MAX_TRADE_SIZE", 100.0)
         self.WEATHER_CITIES = _str("WEATHER_CITIES", "nyc,chicago,miami,los_angeles,denver")
+        self.WEATHER_SOURCE_BENCHMARK_HISTORY_PATH = _str("WEATHER_SOURCE_BENCHMARK_HISTORY_PATH", "data/weather_source_benchmark_history.jsonl")
 
 
 settings = Settings()

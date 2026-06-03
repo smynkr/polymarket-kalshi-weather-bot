@@ -1,7 +1,7 @@
 import { useState, useEffect, Suspense, lazy } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { fetchLiveData, runScan, startBot, stopBot } from './api'
+import { fetchLiveData, fetchWeatherStatus, runScan, startBot, stopBot } from './api'
 import type { LiveData, KalshiPosition, PolyPosition, MetarV2Signal } from './types'
 import { SignalsTable } from './components/SignalsTable'
 import { Terminal } from './components/Terminal'
@@ -44,6 +44,12 @@ function RefreshBar({ interval }: { interval: number }) {
 
 function fmt(n: number, decimals = 2) {
   return n.toFixed(decimals)
+}
+
+function fmtAge(seconds?: number | null) {
+  if (seconds === undefined || seconds === null) return '—'
+  if (seconds < 60) return `${seconds.toFixed(0)}s`
+  return `${(seconds / 60).toFixed(1)}m`
 }
 
 function pnlColor(n: number) {
@@ -290,6 +296,12 @@ function App() {
     refetchInterval: 10000,
   })
 
+  const { data: weatherStatus } = useQuery({
+    queryKey: ['weatherStatus'],
+    queryFn: fetchWeatherStatus,
+    refetchInterval: 10000,
+  })
+
   const scanMutation = useMutation({
     mutationFn: runScan,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['liveData'] }),
@@ -309,6 +321,8 @@ function App() {
   const liveData = data as LiveData | undefined
   const isRunning = liveData?.system?.services?.some(s => s.running) ?? false
   const v2Signals = liveData?.metar_v2_signals ?? []
+  const weatherSignals = liveData?.weather_signals ?? []
+  const weatherForecasts = liveData?.weather_forecasts ?? []
 
   if (isLoading) {
     return (
@@ -441,13 +455,41 @@ function App() {
               </div>
             </motion.div>
 
+            {/* Weather freshness / nowcast SLO */}
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="shrink-0 border-b border-neutral-800 px-2 py-2">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] text-neutral-500 uppercase tracking-wider">Weather Status</span>
+                <span className={`px-1 py-0.5 text-[8px] font-bold uppercase ${weatherStatus?.enabled ? 'bg-green-500/10 text-green-400 border border-green-500/20' : 'bg-neutral-800 text-neutral-500 border border-neutral-700'}`}>
+                  {weatherStatus?.enabled ? 'Nowcast' : 'Disabled'}
+                </span>
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-[10px]">
+                  <span className="text-neutral-500">Next fast</span>
+                  <span className="text-cyan-400 tabular-nums">{fmtAge(weatherStatus?.next_fast_scan_in_seconds)}</span>
+                </div>
+                <div className="flex justify-between text-[10px]">
+                  <span className="text-neutral-500">Obs age</span>
+                  <span className="text-cyan-400 tabular-nums">{fmtAge(weatherStatus?.last_observation_age_seconds)}</span>
+                </div>
+                <div className="flex justify-between text-[10px]">
+                  <span className="text-neutral-500">Station</span>
+                  <span className="text-neutral-400 tabular-nums">{weatherStatus?.last_observation?.station_id || '—'}</span>
+                </div>
+                <div className="flex justify-between text-[10px]">
+                  <span className="text-neutral-500">Last change</span>
+                  <span className="text-neutral-400 tabular-nums">{String(weatherStatus?.last_change?.state || '—')}</span>
+                </div>
+              </div>
+            </motion.div>
+
             {/* Edge distribution */}
             <div className="border-b border-neutral-800" style={{ height: '28%', minHeight: '120px' }}>
               <div className="px-2 py-1 border-b border-neutral-800 flex items-center justify-between shrink-0">
                 <span className="text-[10px] text-neutral-500 uppercase tracking-wider">Edge Distribution</span>
               </div>
               <div className="h-[calc(100%-24px)] p-1">
-                <EdgeDistribution btcSignals={[]} weatherSignals={[]} />
+                <EdgeDistribution btcSignals={[]} weatherSignals={weatherSignals} />
               </div>
             </div>
 
@@ -473,7 +515,7 @@ function App() {
                     <span className="text-[10px] text-neutral-600 uppercase tracking-wider">Loading Globe...</span>
                   </div>
                 }>
-                  <GlobeView forecasts={[]} signals={[]} />
+                  <GlobeView forecasts={weatherForecasts} signals={weatherSignals} />
                 </Suspense>
               </div>
               <div className="absolute top-2 left-2 z-10">
@@ -492,7 +534,7 @@ function App() {
               <span className="text-[10px] text-neutral-500 uppercase tracking-wider">Weather Signals</span>
             </div>
             <div className="flex-1 overflow-y-auto min-h-0">
-              <SignalsTable signals={[]} weatherSignals={[]} onSimulateTrade={() => {}} isSimulating={false} />
+              <SignalsTable signals={[]} weatherSignals={weatherSignals} onSimulateTrade={() => {}} isSimulating={false} />
             </div>
           </div>
         </div>

@@ -20,6 +20,144 @@ scheduler: Optional[AsyncIOScheduler] = None
 # Event log for terminal display (in-memory, last 200 events)
 event_log: List[dict] = []
 MAX_LOG_SIZE = 200
+_weather_threshold_state_cache: dict[str, str] = {}
+_weather_observation_hash_by_station: dict[str, str] = {}
+
+
+def _today():
+    return datetime.utcnow().date()
+
+
+def weather_threshold_state(signal) -> str:
+    """Classify a weather market's current threshold state for state-change logs."""
+    explicit = getattr(signal, "threshold_state", None)
+    if explicit:
+        return explicit
+
+    source_observations = getattr(signal, "source_observations", None)
+    source_fusion_policy = getattr(signal, "source_fusion_policy", None)
+    if source_observations and source_fusion_policy:
+        from backend.core.weather_source_fusion import fuse_weather_observations
+        market = getattr(signal, "market", None)
+        fused = fuse_weather_observations(
+            observations=source_observations,
+            policy=source_fusion_policy,
+            threshold_f=getattr(market, "threshold_f", 0.0),
+            metric=getattr(market, "metric", "high"),
+        )
+        if fused.lock_state == "locked":
+            return "locked"
+        if fused.lock_state == "below":
+            return "below"
+
+    observation = getattr(signal, "weather_observation", None)
+    if observation is None:
+        return "unavailable"
+    if getattr(signal, "signal_source", None) == "METAR-lock":
+        return "locked"
+
+    threshold_f = getattr(getattr(signal, "market", None), "threshold_f", None)
+    temp_f = getattr(observation, "temp_f", None)
+    if threshold_f is None or temp_f is None:
+        return "unavailable"
+
+    metric = getattr(getattr(signal, "market", None), "metric", "")
+    if metric == "low":
+        if temp_f <= threshold_f:
+            return "crossed"
+        if temp_f <= threshold_f + 2:
+            return "near"
+        return "below"
+
+    if temp_f >= threshold_f:
+        return "crossed"
+    if temp_f >= threshold_f - 2:
+        return "near"
+    return "below"
+
+
+def plan_nowcast_impacted_recomputes(signals) -> list:
+    """Plan event-driven recomputes only for stations whose raw observation changed."""
+    from backend.core.weather_signals import plan_impacted_weather_recompute
+
+    plans = []
+    observations_by_station = {}
+    for signal in signals:
+        observation = getattr(signal, "weather_observation", None)
+        if observation is None:
+            continue
+        observations_by_station[observation.station_id.upper()] = observation
+
+    for station, observation in observations_by_station.items():
+        plan = plan_impacted_weather_recompute(
+            observation,
+            signals,
+            as_of_date=_today(),
+            previous_hash_by_station=_weather_observation_hash_by_station,
+        )
+        if not plan.changed:
+            continue
+        _weather_observation_hash_by_station[station] = observation.raw_hash
+        plans.append(plan)
+    return plans
+
+
+async def execute_nowcast_recompute_plans(plans) -> list:
+    """Run scoped recomputes for changed-station plans with impacted market ids."""
+    from backend.core.weather_signals import recompute_weather_signals_for_tickers
+
+    recomputed = []
+    seen_tickers = set()
+    for plan in plans:
+        tickers = [ticker for ticker in getattr(plan, "market_ids", []) if ticker not in seen_tickers]
+        if not tickers:
+            continue
+        seen_tickers.update(tickers)
+        signals = await recompute_weather_signals_for_tickers(tickers)
+        recomputed.append({
+            "station_id": getattr(plan, "station_id", None),
+            "market_ids": tickers,
+            "signals_recomputed": len(signals),
+        })
+    return recomputed
+
+
+def emit_weather_threshold_state_changes(signals) -> list[dict]:
+    """Log only changed weather threshold states; suppress unchanged refresh noise."""
+    changes = []
+    for signal in signals:
+        market = getattr(signal, "market", None)
+        market_id = getattr(market, "market_id", None)
+        if not market_id:
+            continue
+
+        state = weather_threshold_state(signal)
+        previous = _weather_threshold_state_cache.get(market_id)
+        if previous == state:
+            continue
+
+        _weather_threshold_state_cache[market_id] = state
+        observation = getattr(signal, "weather_observation", None)
+        data = {
+            "market_id": market_id,
+            "previous_state": previous,
+            "state": state,
+            "city": getattr(market, "city_name", ""),
+            "metric": getattr(market, "metric", ""),
+            "threshold_f": getattr(market, "threshold_f", None),
+            "temp_f": getattr(observation, "temp_f", None),
+            "station_id": getattr(observation, "station_id", None),
+            "observed_at": observation.observed_at.isoformat() if observation else None,
+            "signal_source": getattr(signal, "signal_source", None),
+            "metar_note": getattr(signal, "metar_note", ""),
+        }
+        changes.append(data)
+        log_event(
+            "weather_state_change",
+            f"Weather threshold state changed: {market_id} {previous or 'new'} → {state}",
+            data,
+        )
+    return changes
 
 
 def log_event(event_type: str, message: str, data: dict = None):
@@ -332,6 +470,39 @@ async def weather_scan_and_trade_job():
         logger.exception("Error in weather_scan_and_trade_job")
 
 
+async def weather_nowcast_job():
+    """
+    Fast weather-observation refresh lane.
+
+    Keeps same-day METAR/current-observation data fresh independently from the
+    slower full Kalshi+GFS scan. It deliberately reuses the weather signal path
+    for now so fresh observations, raw hashes, and latency records are emitted
+    without a separate trading loop.
+    """
+    log_event("info", "Refreshing fast weather nowcast observations...")
+    try:
+        from backend.core.weather_signals import scan_for_weather_signals
+        signals = await scan_for_weather_signals()
+        observed = sum(1 for s in signals if getattr(s, "weather_observation", None) is not None)
+        recompute_plans = plan_nowcast_impacted_recomputes(signals)
+        recompute_results = await execute_nowcast_recompute_plans(recompute_plans)
+        changes = emit_weather_threshold_state_changes(signals)
+        if changes or recompute_plans:
+            log_event("data", f"Weather nowcast refreshed: {observed} observed signal(s), {len(changes)} state change(s), {len(recompute_plans)} recompute plan(s)", {
+                "total_signals": len(signals),
+                "observed_signals": observed,
+                "state_changes": len(changes),
+                "recompute_plans": [plan.__dict__ for plan in recompute_plans],
+                "recompute_results": recompute_results,
+            })
+        else:
+            logger.debug("Weather nowcast refreshed: %s observed signal(s), no state changes", observed)
+            return
+    except Exception as e:
+        log_event("error", f"Weather nowcast error: {str(e)}")
+        logger.exception("Error in weather_nowcast_job")
+
+
 async def settlement_job():
     """
     Background job: Check and settle pending trades.
@@ -454,7 +625,16 @@ def start_scheduler():
     # Weather trading jobs (gated by WEATHER_ENABLED)
     if settings.WEATHER_ENABLED:
         weather_scan_seconds = settings.WEATHER_SCAN_INTERVAL_SECONDS
+        weather_nowcast_seconds = settings.WEATHER_NOWCAST_INTERVAL_SECONDS
         weather_settle_seconds = settings.WEATHER_SETTLEMENT_INTERVAL_SECONDS
+
+        scheduler.add_job(
+            weather_nowcast_job,
+            IntervalTrigger(seconds=weather_nowcast_seconds),
+            id="weather_nowcast",
+            replace_existing=True,
+            max_instances=1,
+        )
 
         scheduler.add_job(
             weather_scan_and_trade_job,

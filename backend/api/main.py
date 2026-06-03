@@ -261,6 +261,25 @@ class WeatherSignalResponse(BaseModel):
     ensemble_mean: float
     ensemble_std: float
     ensemble_members: int
+    signal_source: Optional[str] = None
+    metar_note: Optional[str] = None
+    observation_source: Optional[str] = None
+    station_id: Optional[str] = None
+    observed_at: Optional[str] = None
+    fetched_at: Optional[str] = None
+    signal_at: Optional[str] = None
+    observation_latency_seconds: Optional[float] = None
+    signal_latency_seconds: Optional[float] = None
+    threshold_state: Optional[str] = None
+    fusion_lock_state: Optional[str] = None
+    fusion_trade_allowed: Optional[bool] = None
+    fusion_authority_source: Optional[str] = None
+    fusion_watch_sources: List[str] = []
+    fusion_rejected_sources: List[str] = []
+    fusion_conflicts: List[str] = []
+    fusion_skip_reason: Optional[str] = None
+    raw_hash: Optional[str] = None
+    source_url: Optional[str] = None
     actionable: bool = False
 
 
@@ -282,6 +301,16 @@ class EventResponse(BaseModel):
     type: str
     message: str
     data: dict = {}
+
+
+class WeatherStatusResponse(BaseModel):
+    enabled: bool
+    fast_loop_interval_seconds: int
+    next_fast_scan_in_seconds: Optional[float] = None
+    cache_age_seconds: Optional[float] = None
+    last_observation_age_seconds: Optional[float] = None
+    last_observation: Optional[dict] = None
+    last_change: Optional[dict] = None
 
 
 # Startup / Shutdown
@@ -1148,6 +1177,158 @@ async def get_weather_markets():
     ]
 
 
+class WeatherSourceBenchmarkRunRequest(BaseModel):
+    station_id: str
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
+
+class WeatherSourceBenchmarkBatchRequest(BaseModel):
+    targets: List[WeatherSourceBenchmarkRunRequest]
+
+
+@app.get("/api/weather/source-benchmark")
+async def get_weather_source_benchmark():
+    """Return benchmark-backed source-fusion evidence and conservative policy."""
+    from backend.core.weather_source_benchmark import (
+        build_source_promotion_policy,
+        summarize_source_benchmark_history,
+    )
+
+    history_path = settings.WEATHER_SOURCE_BENCHMARK_HISTORY_PATH or "data/weather_source_benchmark_history.jsonl"
+    summary = summarize_source_benchmark_history(history_path)
+    policy = build_source_promotion_policy(summary)
+    return {
+        "history_path": history_path,
+        "summary": summary,
+        "policy": policy,
+    }
+
+
+@app.post("/api/weather/source-benchmark/run")
+async def run_weather_source_benchmark(request: WeatherSourceBenchmarkRunRequest):
+    """Run and persist a bounded weather-source benchmark for one station."""
+    from dataclasses import asdict
+    from backend.core.weather_source_benchmark import (
+        append_source_benchmark_result,
+        benchmark_observation_sources,
+        build_source_promotion_policy,
+        default_benchmark_providers,
+        summarize_source_benchmark,
+    )
+
+    result = benchmark_observation_sources(
+        station_id=request.station_id.upper(),
+        lat=request.lat,
+        lon=request.lon,
+        providers=default_benchmark_providers(),
+    )
+    run_id = datetime.utcnow().isoformat()
+    history_path = settings.WEATHER_SOURCE_BENCHMARK_HISTORY_PATH or "data/weather_source_benchmark_history.jsonl"
+    append_source_benchmark_result(history_path, result, run_id=run_id)
+    summary = summarize_source_benchmark(result.rows, failures=result.failures)
+    policy = build_source_promotion_policy(summary)
+    return {
+        "run_id": run_id,
+        "station_id": result.station_id,
+        "history_path": history_path,
+        "rows": [asdict(row) for row in result.rows],
+        "failures": result.failures,
+        "summary": summary,
+        "policy": policy,
+    }
+
+
+@app.get("/api/weather/status", response_model=WeatherStatusResponse)
+async def get_weather_status():
+    """Expose Weather Edge nowcast freshness and threshold-state SLO fields."""
+    from backend.core import scheduler as scheduler_mod
+    from backend.core.weather_signals import get_cached_signals, get_signal_cache_age_seconds
+
+    signals = get_cached_signals() if settings.WEATHER_ENABLED else []
+    observations = [getattr(signal, "weather_observation", None) for signal in signals]
+    observations = [observation for observation in observations if observation is not None]
+    latest_observation = max(observations, key=lambda obs: obs.fetched_at, default=None)
+    now = datetime.utcnow()
+    cache_age = get_signal_cache_age_seconds() if settings.WEATHER_ENABLED else None
+    if cache_age == float("inf"):
+        cache_age = None
+
+    last_change = None
+    for event in reversed(scheduler_mod.get_recent_events(200)):
+        if event.get("type") == "weather_state_change":
+            last_change = event.get("data") or {}
+            break
+
+    return WeatherStatusResponse(
+        enabled=settings.WEATHER_ENABLED,
+        fast_loop_interval_seconds=settings.WEATHER_NOWCAST_INTERVAL_SECONDS,
+        next_fast_scan_in_seconds=(
+            max(0.0, settings.WEATHER_NOWCAST_INTERVAL_SECONDS - float(cache_age))
+            if cache_age is not None else None
+        ),
+        cache_age_seconds=cache_age,
+        last_observation_age_seconds=(
+            max(0.0, (now - latest_observation.observed_at).total_seconds())
+            if latest_observation is not None else None
+        ),
+        last_observation=(
+            {
+                "source": latest_observation.source,
+                "station_id": latest_observation.station_id,
+                "observed_at": latest_observation.observed_at.isoformat(),
+                "fetched_at": latest_observation.fetched_at.isoformat(),
+                "temp_f": latest_observation.temp_f,
+                "raw_hash": latest_observation.raw_hash,
+            }
+            if latest_observation is not None else None
+        ),
+        last_change=last_change,
+    )
+
+
+@app.post("/api/weather/source-benchmark/batch")
+async def run_weather_source_benchmark_batch(request: WeatherSourceBenchmarkBatchRequest):
+    """Run and persist bounded weather-source benchmarks for multiple stations."""
+    from dataclasses import asdict
+    from backend.core.weather_source_benchmark import (
+        StationBenchmarkTarget,
+        build_source_promotion_policy,
+        default_benchmark_providers,
+        run_station_benchmark_batch,
+        summarize_source_benchmark_history,
+    )
+
+    run_id = datetime.utcnow().isoformat()
+    history_path = settings.WEATHER_SOURCE_BENCHMARK_HISTORY_PATH or "data/weather_source_benchmark_history.jsonl"
+    targets = [
+        StationBenchmarkTarget(station_id=target.station_id.upper(), lat=target.lat, lon=target.lon)
+        for target in request.targets
+    ]
+    results = run_station_benchmark_batch(
+        targets,
+        providers=default_benchmark_providers(),
+        history_path=history_path,
+        run_id=run_id,
+    )
+    summary = summarize_source_benchmark_history(history_path)
+    policy = build_source_promotion_policy(summary)
+    return {
+        "run_id": run_id,
+        "history_path": history_path,
+        "results": [
+            {
+                "station_id": result.station_id,
+                "rows": [asdict(row) for row in result.rows],
+                "failures": result.failures,
+            }
+            for result in results
+        ],
+        "summary": summary,
+        "policy": policy,
+    }
+
+
 @app.get("/api/weather/signals", response_model=List[WeatherSignalResponse])
 async def get_weather_signals():
     """Get current weather trading signals from cache (populated by background scanner)."""
@@ -1171,6 +1352,25 @@ async def get_weather_signals():
 def _weather_signal_to_response(s) -> WeatherSignalResponse:
     # Support both old WeatherTradingSignal (from weather_signals.py) formats
     net_edge = getattr(s, "net_edge", s.edge)
+    observation = getattr(s, "weather_observation", None)
+    signal_at = getattr(s, "signal_at", None)
+    observation_latency = None
+    signal_latency = None
+    if observation is not None:
+        observation_latency = observation.freshness_seconds
+        if signal_at is not None:
+            signal_latency = max(0.0, (signal_at - observation.fetched_at).total_seconds())
+    fused = None
+    source_observations = getattr(s, "source_observations", None)
+    source_fusion_policy = getattr(s, "source_fusion_policy", None)
+    if source_observations and source_fusion_policy:
+        from backend.core.weather_source_fusion import fuse_weather_observations
+        fused = fuse_weather_observations(
+            observations=source_observations,
+            policy=source_fusion_policy,
+            threshold_f=s.market.threshold_f,
+            metric=s.market.metric,
+        )
     return WeatherSignalResponse(
         market_id=s.market.market_id,
         city_key=s.market.city_key,
@@ -1188,6 +1388,25 @@ def _weather_signal_to_response(s) -> WeatherSignalResponse:
         ensemble_mean=s.ensemble_mean,
         ensemble_std=s.ensemble_std,
         ensemble_members=s.ensemble_members,
+        signal_source=getattr(s, "signal_source", None),
+        metar_note=getattr(s, "metar_note", None),
+        observation_source=getattr(observation, "source", None),
+        station_id=getattr(observation, "station_id", None),
+        observed_at=observation.observed_at.isoformat() if observation else None,
+        fetched_at=observation.fetched_at.isoformat() if observation else None,
+        signal_at=signal_at.isoformat() if signal_at else None,
+        observation_latency_seconds=observation_latency,
+        signal_latency_seconds=signal_latency,
+        threshold_state=getattr(s, "threshold_state", None),
+        fusion_lock_state=getattr(fused, "lock_state", None),
+        fusion_trade_allowed=getattr(fused, "trade_allowed", None),
+        fusion_authority_source=getattr(fused, "authority_source", None),
+        fusion_watch_sources=getattr(fused, "watch_sources", []),
+        fusion_rejected_sources=getattr(fused, "rejected_sources", []),
+        fusion_conflicts=getattr(fused, "conflicts", []),
+        fusion_skip_reason=getattr(fused, "skip_reason", None),
+        raw_hash=getattr(observation, "raw_hash", None),
+        source_url=getattr(observation, "source_url", None),
         actionable=s.passes_threshold,
     )
 

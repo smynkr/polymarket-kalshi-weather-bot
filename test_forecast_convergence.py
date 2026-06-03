@@ -71,7 +71,7 @@ def test_forecast_history_ignores_malformed_per_key_rows_and_normalizes_city(tmp
 
 
 def test_weather_signal_size_is_scaled_by_forecast_convergence(monkeypatch):
-    target = date.today()
+    target = date.today() + timedelta(days=1)
     market = {
         "ticker": "KXHIGHNY-26MAY24-T70",
         "title": "New York high temperature above 70°F",
@@ -156,7 +156,7 @@ def test_weather_signal_size_is_scaled_by_forecast_convergence(monkeypatch):
 
 
 def test_forecast_convergence_failure_scales_size_conservatively(monkeypatch):
-    target = date.today()
+    target = date.today() + timedelta(days=1)
     market = {
         "ticker": "KXHIGHNY-26MAY24-T70",
         "title": "New York high temperature above 70°F",
@@ -299,7 +299,23 @@ def test_metar_lock_temperature_signal_bypasses_forecast_convergence(monkeypatch
         "compute_probability",
         lambda ensemble, target_date, market_info: {"prob": 0.65, "mean": 74.2, "std": 1.0, "n": 31},
     )
-    monkeypatch.setattr(ws, "get_metar_temps", lambda city, today: {"max_temp_f": 75.0, "current_temp_f": 75.0, "local_hour": 16})
+    fetched_at = datetime.now(timezone.utc)
+    observation = ws.WeatherObservation(
+        source="aviationweather_metar",
+        station_id="KJFK",
+        observed_at=fetched_at - timedelta(seconds=30),
+        fetched_at=fetched_at,
+        temp_f=75.0,
+        raw={"rawOb": "KJFK test"},
+        raw_hash="metar-lock-hash",
+        source_url="https://aviationweather.gov/api/data/metar?ids=KJFK&format=json&hours=12",
+    )
+    monkeypatch.setattr(ws, "get_metar_temps", lambda city, today: {
+        "max_temp_f": 75.0,
+        "current_temp_f": 75.0,
+        "local_hour": 16,
+        "observation": observation,
+    })
     monkeypatch.setattr(ws.settings, "INITIAL_BANKROLL", 10_000.0)
     monkeypatch.setattr(ws.settings, "WEATHER_MAX_TRADE_SIZE", 100.0)
     monkeypatch.setattr(ws.settings, "WEATHER_MIN_EDGE_THRESHOLD", 0.01)
