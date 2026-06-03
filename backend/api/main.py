@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 import asyncio
 import json
@@ -1187,6 +1187,16 @@ class WeatherSourceBenchmarkBatchRequest(BaseModel):
     targets: List[WeatherSourceBenchmarkRunRequest]
 
 
+MAX_WEATHER_SOURCE_BENCHMARK_BATCH_TARGETS = 10
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalize datetimes before age arithmetic; tolerate legacy naive UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 @app.get("/api/weather/source-benchmark")
 async def get_weather_source_benchmark():
     """Return benchmark-backed source-fusion evidence and conservative policy."""
@@ -1248,8 +1258,8 @@ async def get_weather_status():
     signals = get_cached_signals() if settings.WEATHER_ENABLED else []
     observations = [getattr(signal, "weather_observation", None) for signal in signals]
     observations = [observation for observation in observations if observation is not None]
-    latest_observation = max(observations, key=lambda obs: obs.fetched_at, default=None)
-    now = datetime.utcnow()
+    latest_observation = max(observations, key=lambda obs: _as_utc(obs.fetched_at), default=None)
+    now = _as_utc(datetime.utcnow())
     cache_age = get_signal_cache_age_seconds() if settings.WEATHER_ENABLED else None
     if cache_age == float("inf"):
         cache_age = None
@@ -1269,7 +1279,7 @@ async def get_weather_status():
         ),
         cache_age_seconds=cache_age,
         last_observation_age_seconds=(
-            max(0.0, (now - latest_observation.observed_at).total_seconds())
+            max(0.0, (now - _as_utc(latest_observation.observed_at)).total_seconds())
             if latest_observation is not None else None
         ),
         last_observation=(
@@ -1298,6 +1308,12 @@ async def run_weather_source_benchmark_batch(request: WeatherSourceBenchmarkBatc
         run_station_benchmark_batch,
         summarize_source_benchmark_history,
     )
+
+    if not 1 <= len(request.targets) <= MAX_WEATHER_SOURCE_BENCHMARK_BATCH_TARGETS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"targets must contain 1-{MAX_WEATHER_SOURCE_BENCHMARK_BATCH_TARGETS} stations",
+        )
 
     run_id = datetime.utcnow().isoformat()
     history_path = settings.WEATHER_SOURCE_BENCHMARK_HISTORY_PATH or "data/weather_source_benchmark_history.jsonl"
