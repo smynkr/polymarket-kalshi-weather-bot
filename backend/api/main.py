@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 import asyncio
 import json
+import math
 import os
 import stat
 import tempfile
@@ -121,6 +122,19 @@ def _log_event(event_type: str, message: str, data: Optional[dict] = None) -> No
 
 
 # Pydantic response models
+def _safe_float(value, default: Optional[float] = 0.0) -> Optional[float]:
+    """Return finite JSON-safe floats only; sanitize DB/provider NaN/Infinity/None."""
+    if value is None:
+        return default
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(numeric):
+        return default
+    return numeric
+
+
 class BtcPriceResponse(BaseModel):
     price: float
     change_24h: float
@@ -404,14 +418,17 @@ async def get_stats(db: Session = Depends(get_db)):
     if not state:
         raise HTTPException(status_code=404, detail="Bot state not initialized")
 
+    bankroll = _safe_float(state.bankroll, 0.0) or 0.0
+    total_pnl = _safe_float(state.total_pnl, 0.0) or 0.0
     win_rate = state.winning_trades / state.total_trades if state.total_trades > 0 else 0
+    win_rate = _safe_float(win_rate, 0.0) or 0.0
 
     return BotStats(
-        bankroll=state.bankroll,
+        bankroll=bankroll,
         total_trades=state.total_trades,
         winning_trades=state.winning_trades,
         win_rate=win_rate,
-        total_pnl=state.total_pnl,
+        total_pnl=total_pnl,
         is_running=state.is_running,
         last_run=state.last_run
     )
@@ -570,12 +587,12 @@ async def get_trades(
             platform=t.platform,
             event_slug=t.event_slug,
             direction=t.direction,
-            entry_price=t.entry_price,
-            size=t.size,
+            entry_price=_safe_float(t.entry_price, 0.0) or 0.0,
+            size=_safe_float(t.size, 0.0) or 0.0,
             timestamp=t.timestamp,
             settled=t.settled,
             result=t.result,
-            pnl=t.pnl
+            pnl=_safe_float(t.pnl, None)
         )
         for t in trades
     ]
@@ -609,8 +626,9 @@ async def get_equity_curve(db: Session = Depends(get_db)):
     bankroll = settings.INITIAL_BANKROLL
 
     for trade in trades:
-        if trade.pnl is not None:
-            cumulative_pnl += trade.pnl
+        pnl = _safe_float(trade.pnl, None)
+        if pnl is not None:
+            cumulative_pnl += pnl
             curve.append({
                 "timestamp": trade.timestamp.isoformat(),
                 "pnl": cumulative_pnl,
@@ -1592,12 +1610,12 @@ async def get_dashboard(db: Session = Depends(get_db)):
             platform=t.platform,
             event_slug=t.event_slug,
             direction=t.direction,
-            entry_price=t.entry_price,
-            size=t.size,
+            entry_price=_safe_float(t.entry_price, 0.0) or 0.0,
+            size=_safe_float(t.size, 0.0) or 0.0,
             timestamp=t.timestamp,
             settled=t.settled,
             result=t.result,
-            pnl=t.pnl
+            pnl=_safe_float(t.pnl, None)
         )
         for t in trades
     ]
@@ -1607,8 +1625,9 @@ async def get_dashboard(db: Session = Depends(get_db)):
     equity_curve = []
     cumulative_pnl = 0
     for trade in equity_trades:
-        if trade.pnl is not None:
-            cumulative_pnl += trade.pnl
+        pnl = _safe_float(trade.pnl, None)
+        if pnl is not None:
+            cumulative_pnl += pnl
             equity_curve.append({
                 "timestamp": trade.timestamp.isoformat(),
                 "pnl": cumulative_pnl,
